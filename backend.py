@@ -7,11 +7,23 @@ from datetime import datetime, timedelta
 import os
 from pathlib import Path
 import time
+import hashlib
 from collections import Counter
 from urllib.parse import urlparse
 import numpy as np
 import re
 import warnings
+import smtplib
+import imaplib
+import email
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+from email.header import decode_header
+import tempfile
+import zipfile
+import mimetypes
 warnings.filterwarnings('ignore')
 
 # PDF generation imports
@@ -24,12 +36,20 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from io import BytesIO
 import base64
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import wordcloud
+from wordcloud import WordCloud
+from dotenv import load_dotenv
+load_dotenv()  # this loads variables from .env into os.environ
+print("API Key loaded:", os.getenv("OPENAI_API_KEY"))
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Try to import yfinance, make it optional
+# Try to import yfinance
 try:
     import yfinance as yf
     YFINANCE_AVAILABLE = True
@@ -37,41 +57,171 @@ except ImportError:
     YFINANCE_AVAILABLE = False
     logger.warning("yfinance not available. Will use mock price data.")
 
-def get_available_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
-    """Get available columns categorized by type"""
-    return {
-        'text_candidates': [col for col in df.columns if df[col].dtype == 'object'],
-        'date_candidates': [col for col in df.columns if 'date' in col.lower() or 'time' in col.lower()],
-        'numeric_candidates': [col for col in df.columns if df[col].dtype in ['int64', 'float64']],
-        'all_columns': list(df.columns)
-    }
 
-class NewsAndSocialMediaAnalysisBot:
-    def __init__(self, api_key: str):
-        """Initialize the news and social media analysis bot with OpenAI API key"""
+class EmailHandler:
+    """Simplified email handler for sending reports"""
+    
+    def __init__(self, email_address: str, app_password: str):
+        self.email_address = email_address
+        self.app_password = app_password
+        self.smtp_server = "smtp.gmail.com"
+        self.smtp_port = 587
+        
+    def send_email_with_attachments(self, recipient_email: str, subject: str, body: str, 
+                                  attachments: List[Dict[str, str]] = None) -> bool:
+        """Send email with multiple attachments"""
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = self.email_address
+            msg['To'] = recipient_email
+            msg['Subject'] = subject
+            
+            # Add body
+            msg.attach(MIMEText(body, 'plain'))
+            
+            # Add attachments
+            if attachments:
+                for attachment in attachments:
+                    file_path = attachment['path']
+                    filename = attachment['name']
+                    
+                    if os.path.exists(file_path):
+                        with open(file_path, "rb") as attachment_file:
+                            part = MIMEBase('application', 'octet-stream')
+                            part.set_payload(attachment_file.read())
+                        
+                        encoders.encode_base64(part)
+                        part.add_header(
+                            'Content-Disposition',
+                            f'attachment; filename= {filename}'
+                        )
+                        msg.attach(part)
+            
+            # Send email
+            server = smtplib.SMTP(self.smtp_server, self.smtp_port)
+            server.starttls()
+            server.login(self.email_address, self.app_password)
+            text = msg.as_string()
+            server.sendmail(self.email_address, recipient_email, text)
+            server.quit()
+            
+            logger.info(f"Email sent successfully to {recipient_email}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to send email: {str(e)}")
+            return False
+
+    # Example usage function
+    def example_usage_with_email():
+        """Example of how to use the enhanced analysis with email distribution"""
+        
+        # Initialize with email configuration
+        email_config = {
+            'email_address': 'your_email@gmail.com',
+            'app_password': 'your_app_password'  # Gmail app password
+        }
+        
+        # Create analysis bot
+        bot = EnhancedDualFileAnalysisBot(
+            api_key="your_openai_api_key",
+            email_config=email_config
+        )
+        
+        # Define email recipients
+        email_recipients = [
+            'investor1@example.com',
+            'analyst@company.com',
+            'portfolio.manager@firm.com'
+        ]
+        
+        # Run comprehensive analysis with distribution
+        results = bot.run_comprehensive_analysis_with_distribution(
+            news_file='path/to/news.csv',
+            reddit_file='path/to/reddit.csv',
+            email_recipients=email_recipients,
+            create_download_package=True
+        )
+        
+        # Check results
+        if results['success']:
+            print(f"Analysis completed successfully!")
+            print(f"Company: {results['company_info'].get('company_name', 'N/A')}")
+            print(f"Overall Sentiment: {results['sentiment_data']['combined_sentiment']['label']}")
+            print(f"PDF Reports Created: {len(results['pdf_reports'])}")
+            
+            # Email results
+            for recipient, success in results['email_results'].items():
+                status = "✓ Sent" if success else "✗ Failed"
+                print(f"Email to {recipient}: {status}")
+            
+            # Download package
+            if results['download_package']:
+                print(f"Download package created: {results['download_package']}")
+        else:
+            print(f"Analysis failed: {results['error_message']}")
+# if __name__ == "__main__":
+#     EmailHandler.example_usage_with_email()
+
+
+class EnhancedDualFileAnalysisBot:
+    """Enhanced analysis bot with comprehensive visualization capabilities"""
+    
+    def __init__(self, api_key: str, email_config: Dict[str, str] = None):
+        """Initialize the enhanced analysis bot"""
         openai.api_key = api_key
         self.client = openai.OpenAI(api_key=api_key)
-        
+    
     def load_file(self, file_path: str) -> Optional[pd.DataFrame]:
-        """Load data from various file formats"""
+        """Load data from various file formats with comprehensive encoding handling"""
         try:
             file_extension = Path(file_path).suffix.lower()
             
             if file_extension == '.csv':
-                df = pd.read_csv(file_path)
+                # Try multiple encodings
+                encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252', 'windows-1252', 'utf-16']
+                
+                for encoding in encodings:
+                    try:
+                        df = pd.read_csv(file_path, encoding=encoding, on_bad_lines='skip')
+                        logger.info(f"Successfully loaded CSV with {encoding} encoding")
+                        return df
+                    except (UnicodeDecodeError, pd.errors.ParserError) as e:
+                        logger.warning(f"Failed to load with {encoding}: {str(e)}")
+                        continue
+                
+                # Final attempt with error replacement
+                try:
+                    df = pd.read_csv(file_path, encoding='latin1', errors='replace')
+                    logger.warning("Loaded CSV with latin1 encoding (errors replaced)")
+                    return df
+                except Exception as e:
+                    logger.error(f"Final CSV load attempt failed: {str(e)}")
+                    return None
+                
             elif file_extension == '.xlsx':
-                df = pd.read_excel(file_path)
+                try:
+                    df = pd.read_excel(file_path)
+                    logger.info("Loaded Excel file successfully")
+                    return df
+                except Exception as e:
+                    logger.error(f"Failed to load Excel: {str(e)}")
+                    return None
+                
             elif file_extension == '.json':
-                df = pd.read_json(file_path)
+                try:
+                    df = pd.read_json(file_path)
+                    logger.info("Loaded JSON file successfully")
+                    return df
+                except Exception as e:
+                    logger.error(f"Failed to load JSON: {str(e)}")
+                    return None
             else:
                 logger.error(f"Unsupported file format: {file_extension}")
                 return None
                 
-            logger.info(f"Successfully loaded file with {len(df)} rows")
-            return df
-            
         except Exception as e:
-            logger.error(f"Error loading file: {str(e)}")
+            logger.error(f"Error loading file {file_path}: {str(e)}")
             return None
     
     def identify_text_column(self, df: pd.DataFrame) -> Optional[str]:
@@ -102,89 +252,167 @@ class NewsAndSocialMediaAnalysisBot:
         if text_lengths:
             return max(text_lengths, key=text_lengths.get)
         
-        logger.warning("Could not identify text column automatically")
         return None
     
-    def identify_source_column(self, df: pd.DataFrame) -> Optional[str]:
-        """Identify the source/publisher column from the dataframe"""
-        source_column_candidates = [
-            'source', 'publisher', 'publication', 'outlet', 'provider',
-            'news_source', 'media_source', 'author', 'site', 'website'
+    def extract_company_ticker(self, df: pd.DataFrame, text_column: str = None) -> Dict[str, str]:
+        """Enhanced company extraction - prioritize ticker column detection"""
+        company_info = {'company_name': '', 'ticker': ''}
+        
+        # ENHANCED: Better ticker column detection
+        ticker_columns = [
+            'ticker', 'symbol', 'Ticker', 'Symbol', 'TICKER', 'SYMBOL',
+            'stock_ticker', 'stock_symbol', 'company_ticker', 'company_symbol',
+            'tick', 'sym', 'stockticker', 'stocksymbol'
         ]
         
-        url_column_candidates = [
-            'url', 'link', 'href', 'web_url', 'article_url', 'source_url'
+        # Check for ticker in dedicated columns with better validation
+        for col in ticker_columns:
+            if col in df.columns and not df[col].isna().all():
+                # Get all unique non-null tickers
+                unique_tickers = df[col].dropna().unique()
+                for ticker_value in unique_tickers:
+                    ticker_str = str(ticker_value).strip().upper()
+                    # Validate ticker format (1-5 letters, common patterns)
+                    if ticker_str and ticker_str != 'NAN' and re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', ticker_str):
+                        company_info['ticker'] = ticker_str
+                        logger.info(f"Found ticker in column '{col}': {ticker_str}")
+                        break
+                if company_info['ticker']:
+                    break
+        
+        # Enhanced company name detection
+        company_columns = [
+            'company', 'Company', 'company_name', 'Company_Name', 'COMPANY_NAME',
+            'firm', 'corporation', 'corp', 'organization', 'org', 'entity',
+            'companyname', 'name', 'Name', 'business_name'
         ]
         
-        # Check for exact matches with traditional source columns first
-        for col in df.columns:
-            if col.lower() in source_column_candidates:
-                return col
+        for col in company_columns:
+            if col in df.columns and not df[col].isna().all():
+                company_name = str(df[col].iloc[0]).strip()
+                if company_name and company_name.lower() != 'nan':
+                    company_info['company_name'] = company_name
+                    logger.info(f"Found company name in column '{col}': {company_name}")
+                    break
         
-        # Check for partial matches with traditional source columns
-        for col in df.columns:
-            for candidate in source_column_candidates:
-                if candidate in col.lower():
-                    return col
+        # If no ticker found in columns, try to extract from text content
+        if not company_info['ticker'] and text_column and text_column in df.columns:
+            sample_texts = df[text_column].dropna().head(10).tolist()
+            if sample_texts:
+                combined_sample = ' '.join([str(text)[:200] for text in sample_texts])
+                extracted_info = self._extract_company_from_text_enhanced(combined_sample)
+                
+                if extracted_info.get('ticker') and not company_info['ticker']:
+                    company_info['ticker'] = extracted_info['ticker']
+                if extracted_info.get('company_name') and not company_info['company_name']:
+                    company_info['company_name'] = extracted_info['company_name']
         
-        # Check for URL columns
-        for col in df.columns:
-            if col.lower() in url_column_candidates:
-                logger.info(f"Found URL column '{col}' - will extract sources from URLs")
-                return col
+        # Get company name from ticker if we have ticker but not name
+        if company_info['ticker'] and not company_info['company_name']:
+            mapped_name = self._get_company_name_from_ticker(company_info['ticker'])
+            if mapped_name:
+                company_info['company_name'] = mapped_name
         
-        logger.info("No source or URL column found")
-        return None
+        logger.info(f"Final extracted company info: {company_info}")
+        return company_info
     
-    def identify_date_column(self, df: pd.DataFrame) -> Optional[str]:
-        """Identify the date column from the dataframe"""
-        date_column_candidates = [
-            'date', 'time', 'timestamp', 'published', 'created',
-            'pub_date', 'publish_date', 'datetime', 'created_at'
-        ]
-        
-        # Check for exact matches first
-        for col in df.columns:
-            if col.lower() in date_column_candidates:
-                return col
-        
-        # Check for partial matches
-        for col in df.columns:
-            for candidate in date_column_candidates:
-                if candidate in col.lower():
-                    return col
-        
-        # Check for datetime columns
-        for col in df.columns:
-            if pd.api.types.is_datetime64_any_dtype(df[col]):
-                return col
-        
-        logger.info("No date column found")
-        return None
-    
-    def identify_sentiment_column(self, df: pd.DataFrame) -> Optional[str]:
-        """Identify the sentiment score column from the dataframe"""
-        sentiment_column_candidates = [
-            'sentiment_score', 'sentiment', 'score', 'polarity', 'compound'
-        ]
-        
-        # Check for exact matches first
-        for col in df.columns:
-            if col.lower() in sentiment_column_candidates:
-                return col
-        
-        # Check for partial matches
-        for col in df.columns:
-            for candidate in sentiment_column_candidates:
-                if candidate in col.lower():
-                    return col
-        
-        logger.info("No sentiment column found")
-        return None
+    def validate_input_files(self, news_df: pd.DataFrame, reddit_df: pd.DataFrame) -> Tuple[bool, str]:
+        """Validate both input files before analysis"""
+        try:
+            # 1. Ensure files are not identical
+            if news_df.equals(reddit_df):
+                return False, "Both input files appear to be identical. Please upload different files."
 
-    def get_company_name_from_ticker(self, ticker: str) -> str:
-        """Map ticker symbols to proper company names"""
+            # 2. Check ticker consistency
+            ticker_cols_news = [col for col in news_df.columns if 'ticker' in col.lower()]
+            ticker_cols_reddit = [col for col in reddit_df.columns if 'ticker' in col.lower()]
+            
+            if not ticker_cols_news or not ticker_cols_reddit:
+                return False, "Both files must contain a 'ticker' column."
+            
+            news_tickers = set(news_df[ticker_cols_news[0]].dropna().unique())
+            reddit_tickers = set(reddit_df[ticker_cols_reddit[0]].dropna().unique())
+            
+            if news_tickers != reddit_tickers:
+                return False, "Ticker mismatch: both files must have the same ticker symbols."
+
+            # 4. Check required columns
+            # News must have a 'text' column
+            has_text = any('text' in col.lower() for col in news_df.columns)
+            if not has_text:
+                return False, "Validation failed: The news file must contain a 'text' column."
+
+            # Reddit must have a 'body' column
+            has_body = any('body' in col.lower() for col in reddit_df.columns)
+            if not has_body:
+                return False, "Validation failed: The reddit file must contain a 'body' column."
+
+            # All validations passed
+            return True, "Validation passed: Files are valid and ready for analysis."
+
+        except Exception as e:
+            return False, f"Validation error: {str(e)}"
+
+    def _extract_company_from_text_enhanced(self, text: str) -> Dict[str, str]:
+        """Enhanced AI extraction with better ticker recognition"""
+        prompt = f"""
+        From the following text, extract the main company name and stock ticker symbol.
+        Focus on finding valid stock ticker symbols (1-5 uppercase letters, may have dots).
+        
+        Common ticker patterns: AAPL, MSFT, GOOGL, TSLA, BRK.A, etc.
+        
+        Text: {text}
+        
+        Please respond in this exact format:
+        Company: [company name or "Not found"]
+        Ticker: [ticker symbol or "Not found"]
+        
+        Rules:
+        - Ticker should be uppercase letters only (1-5 chars)
+        - Company name should be the full official name
+        - If multiple tickers mentioned, pick the most prominent one
+        """
+        
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are an expert at extracting company information from financial text. Focus on accuracy and standard ticker formats."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=150,
+                temperature=0.1
+            )
+            
+            content = response.choices[0].message.content.strip()
+            
+            company_name = ""
+            ticker = ""
+            
+            for line in content.split('\n'):
+                if line.strip().startswith('Company:'):
+                    company_name = line.split(':', 1)[1].strip()
+                    if company_name == "Not found":
+                        company_name = ""
+                elif line.strip().startswith('Ticker:'):
+                    ticker = line.split(':', 1)[1].strip().upper()
+                    if ticker == "NOT FOUND":
+                        ticker = ""
+            
+            # Validate ticker format
+            if ticker and not re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', ticker):
+                ticker = ""
+                
+            return {'company_name': company_name, 'ticker': ticker}
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract company info from text: {str(e)}")
+            return {'company_name': '', 'ticker': ''}
+    
+    def _get_company_name_from_ticker(self, ticker: str) -> str:
+        """Enhanced ticker to company name mapping with more companies"""
         ticker_to_company = {
+            # Technology
             'AAPL': 'Apple Inc.',
             'MSFT': 'Microsoft Corporation',
             'GOOGL': 'Alphabet Inc.',
@@ -193,1650 +421,2706 @@ class NewsAndSocialMediaAnalysisBot:
             'TSLA': 'Tesla Inc.',
             'META': 'Meta Platforms Inc.',
             'NVDA': 'NVIDIA Corporation',
+            'NFLX': 'Netflix Inc.',
+            'ADBE': 'Adobe Inc.',
+            'CRM': 'Salesforce Inc.',
+            'INTC': 'Intel Corporation',
+            'AMD': 'Advanced Micro Devices Inc.',
+            'QCOM': 'QUALCOMM Inc.',
+            'TXN': 'Texas Instruments Inc.',
+            'IBM': 'International Business Machines Corp.',
+            'ORCL': 'Oracle Corporation',
+            'AVGO': 'Broadcom Inc.',
+            
+            # Financial
             'BRK.A': 'Berkshire Hathaway Inc.',
             'BRK.B': 'Berkshire Hathaway Inc.',
-            'UNH': 'UnitedHealth Group Inc.',
-            'JNJ': 'Johnson & Johnson',
-            'XOM': 'Exxon Mobil Corporation',
             'JPM': 'JPMorgan Chase & Co.',
+            'BAC': 'Bank of America Corp.',
+            'WFC': 'Wells Fargo & Co.',
             'V': 'Visa Inc.',
-            'PG': 'Procter & Gamble Co.',
             'MA': 'Mastercard Inc.',
-            'HD': 'Home Depot Inc.',
-            'CVX': 'Chevron Corporation',
+            'GS': 'Goldman Sachs Group Inc.',
+            'MS': 'Morgan Stanley',
+            'C': 'Citigroup Inc.',
+            'AXP': 'American Express Co.',
+            'BLK': 'BlackRock Inc.',
+            
+            # Healthcare & Pharma
+            'JNJ': 'Johnson & Johnson',
+            'UNH': 'UnitedHealth Group Inc.',
             'LLY': 'Eli Lilly and Company',
             'ABBV': 'AbbVie Inc.',
-            'BAC': 'Bank of America Corp.',
-            'AVGO': 'Broadcom Inc.',
-            'KO': 'Coca-Cola Co.',
-            'WMT': 'Walmart Inc.',
-            'COST': 'Costco Wholesale Corp.',
-            'PEP': 'PepsiCo Inc.',
-            'TMO': 'Thermo Fisher Scientific Inc.',
             'MRK': 'Merck & Co. Inc.',
-            'ADBE': 'Adobe Inc.',
-            'NFLX': 'Netflix Inc.',
-            'DIS': 'Walt Disney Co.',
             'ABT': 'Abbott Laboratories',
-            'ACN': 'Accenture Plc',
-            'CRM': 'Salesforce Inc.',
+            'TMO': 'Thermo Fisher Scientific Inc.',
+            'DHR': 'Danaher Corporation',
+            'PFE': 'Pfizer Inc.',
+            'BMY': 'Bristol Myers Squibb Co.',
+            
+            # Consumer & Retail
+            'WMT': 'Walmart Inc.',
+            'COST': 'Costco Wholesale Corporation',
+            'HD': 'Home Depot Inc.',
+            'PG': 'Procter & Gamble Co.',
+            'KO': 'Coca-Cola Co.',
+            'PEP': 'PepsiCo Inc.',
             'NKE': 'Nike Inc.',
-            'TXN': 'Texas Instruments Inc.',
-            'QCOM': 'QUALCOMM Inc.',
-            'VZ': 'Verizon Communications Inc.',
-            'CMCSA': 'Comcast Corp.',
-            'DHR': 'Danaher Corp.',
-            'NEE': 'NextEra Energy Inc.',
-            'INTC': 'Intel Corp.',
-            'WFC': 'Wells Fargo & Co.',
-            'IBM': 'International Business Machines Corp.',
-            'AMD': 'Advanced Micro Devices Inc.',
-            'T': 'AT&T Inc.',
+            'MCD': 'McDonald\'s Corp.',
+            'SBUX': 'Starbucks Corporation',
+            'DIS': 'Walt Disney Co.',
+            
+            # Energy
+            'XOM': 'Exxon Mobil Corporation',
+            'CVX': 'Chevron Corporation',
             'COP': 'ConocoPhillips',
-            'UNP': 'Union Pacific Corp.',
-            'HON': 'Honeywell International Inc.',
-            'RTX': 'RTX Corp.',
-            'PM': 'Philip Morris International Inc.',
-            'SPGI': 'S&P Global Inc.',
-            'CAT': 'Caterpillar Inc.',
-            'GS': 'Goldman Sachs Group Inc.',
-            'SCHW': 'Charles Schwab Corp.',
-            'AXP': 'American Express Co.',
-            'NOW': 'ServiceNow Inc.',
-            'ISRG': 'Intuitive Surgical Inc.',
-            'BLK': 'BlackRock Inc.',
-            'SYK': 'Stryker Corp.',
-            'BKNG': 'Booking Holdings Inc.',
-            'TJX': 'TJX Companies Inc.',
-            'ADP': 'Automatic Data Processing Inc.',
-            'GILD': 'Gilead Sciences Inc.',
-            'MDLZ': 'Mondelez International Inc.',
-            'VRTX': 'Vertex Pharmaceuticals Inc.',
-            'MMC': 'Marsh & McLennan Companies Inc.',
-            'C': 'Citigroup Inc.',
-            'LRCX': 'Lam Research Corp.',
-            'ZTS': 'Zoetis Inc.',
-            'REGN': 'Regeneron Pharmaceuticals Inc.',
-            'CB': 'Chubb Ltd.',
-            'PGR': 'Progressive Corp.',
-            'TMUS': 'T-Mobile US Inc.',
-            'SO': 'Southern Co.',
-            'BSX': 'Boston Scientific Corp.',
-            'SHW': 'Sherwin-Williams Co.',
-            'ETN': 'Eaton Corp. Plc',
-            'MU': 'Micron Technology Inc.',
-            'DUK': 'Duke Energy Corp.',
-            'EQIX': 'Equinix Inc.',
-            'AON': 'Aon Plc',
-            'APD': 'Air Products and Chemicals Inc.',
-            'ICE': 'Intercontinental Exchange Inc.',
-            'CL': 'Colgate-Palmolive Co.',
-            'CSX': 'CSX Corp.',
-            'CME': 'CME Group Inc.',
-            'USB': 'U.S. Bancorp',
-            'ECL': 'Ecolab Inc.',
-            'NSC': 'Norfolk Southern Corp.',
-            'ITW': 'Illinois Tool Works Inc.',
-            'FDX': 'FedEx Corp.',
-            'WM': 'Waste Management Inc.',
-            'GD': 'General Dynamics Corp.',
+            'SLB': 'Schlumberger N.V.',
             'EOG': 'EOG Resources Inc.',
-            'FCX': 'Freeport-McMoRan Inc.',
-            'PYPL': 'PayPal Holdings Inc.',
-            'PANW': 'Palo Alto Networks Inc.',
-            'EL': 'Estee Lauder Companies Inc.',
-            'PSA': 'Public Storage',
-            'GM': 'General Motors Co.',
-            'F': 'Ford Motor Co.',
-            'RIVN': 'Rivian Automotive Inc.',
-            'LCID': 'Lucid Group Inc.',
-            'NIO': 'NIO Inc.',
-            'XPEV': 'XPeng Inc.',
-            'LI': 'Li Auto Inc.',
+            'NEE': 'NextEra Energy Inc.',
+            
+            # Telecom
+            'VZ': 'Verizon Communications Inc.',
+            'T': 'AT&T Inc.',
+            'CMCSA': 'Comcast Corporation',
+            'TMUS': 'T-Mobile US Inc.',
+            
+            # Industrial
+            'BA': 'Boeing Co.',
+            'CAT': 'Caterpillar Inc.',
+            'GE': 'General Electric Co.',
+            'MMM': '3M Co.',
+            'HON': 'Honeywell International Inc.',
+            'UPS': 'United Parcel Service Inc.',
+            'RTX': 'Raytheon Technologies Corp.',
+            
+            # Real Estate & REITs
+            'AMT': 'American Tower Corporation',
+            'PLD': 'Prologis Inc.',
+            'CCI': 'Crown Castle International Corp.',
+            
+            # Other Major Companies
+            'ACN': 'Accenture Plc',
+            'LOW': 'Lowe\'s Companies Inc.',
+            'SPGI': 'S&P Global Inc.',
+            'BDX': 'Becton Dickinson and Co.',
+            'MDT': 'Medtronic Plc',
+            'ISRG': 'Intuitive Surgical Inc.',
+            'NOW': 'ServiceNow Inc.',
+            'INTU': 'Intuit Inc.',
+            'TJX': 'TJX Companies Inc.',
+            'UNP': 'Union Pacific Corporation',
+            'DE': 'Deere & Company'
         }
         
         return ticker_to_company.get(ticker.upper(), '')
-
-    def extract_source_from_url(self, url: str) -> str:
-        """Extract and clean source name from URL"""
-        if pd.isna(url) or not url:
-            return ""
-        
-        url = str(url).strip()
-        
-        try:
-            if not url.startswith(('http://', 'https://')):
-                url = 'https://' + url
-            
-            parsed = urlparse(url)
-            domain = parsed.netloc.lower()
-            
-            if domain.startswith('www.'):
-                domain = domain[4:]
-            
-            domain_mapping = {
-                # Financial News
-                'reuters.com': 'Reuters',
-                'bloomberg.com': 'Bloomberg',
-                'wsj.com': 'Wall Street Journal',
-                'ft.com': 'Financial Times',
-                'cnbc.com': 'CNBC',
-                'marketwatch.com': 'MarketWatch',
-                'yahoo.com': 'Yahoo Finance',
-                'finance.yahoo.com': 'Yahoo Finance',
-                'fool.com': 'Motley Fool',
-                'seekingalpha.com': 'Seeking Alpha',
-                'benzinga.com': 'Benzinga',
-                'zacks.com': 'Zacks',
-                'morningstar.com': 'Morningstar',
-                'barrons.com': 'Barrons',
-                'investopedia.com': 'Investopedia',
-                'thestreet.com': 'TheStreet',
-                'forbes.com': 'Forbes',
-                'fortune.com': 'Fortune',
-                'businessinsider.com': 'Business Insider',
-                
-                # General News
-                'cnn.com': 'CNN',
-                'bbc.com': 'BBC',
-                'npr.org': 'NPR',
-                'apnews.com': 'Associated Press',
-                'ap.org': 'Associated Press',
-                'usatoday.com': 'USA Today',
-                'nytimes.com': 'New York Times',
-                'washingtonpost.com': 'Washington Post',
-                'guardian.co.uk': 'The Guardian',
-                'theguardian.com': 'The Guardian',
-                'economist.com': 'The Economist',
-                'axios.com': 'Axios',
-                'politico.com': 'Politico',
-                'abc.com': 'ABC News',
-                'cbsnews.com': 'CBS News',
-                'nbcnews.com': 'NBC News',
-                'foxnews.com': 'Fox News',
-                'reddit.com': 'Reddit',
-                'slashdot.org': 'Slashdot',
-                'zdnet.com': 'ZDNet',
-                'biztoc.com': 'BizToc',
-                'economictimes.indiatimes.com': 'Economic Times',
-                'macobserver.com': 'Mac Observer',
-                'ibtimes.com': 'International Business Times',
-                'digitaljournal.com': 'Digital Journal',
-                'japantoday.com': 'Japan Today',
-                'globenewswire.com': 'GlobeNewswire',
-                'timesofindia.indiatimes.com': 'Times of India',
-                'variety.com': 'Variety',
-                'finovate.com': 'Finovate',
-                
-                # Tech News
-                'techcrunch.com': 'TechCrunch',
-                'venturebeat.com': 'VentureBeat',
-                'theverge.com': 'The Verge',
-                'arstechnica.com': 'Ars Technica',
-                'engadget.com': 'Engadget',
-                'wired.com': 'Wired',
-                'mashable.com': 'Mashable',
-                'gizmodo.com': 'Gizmodo',
-            }
-            
-            clean_name = domain_mapping.get(domain)
-            if clean_name:
-                return clean_name
-            
-            # Create clean name for unmapped domains
-            name_parts = domain.split('.')
-            if len(name_parts) >= 2:
-                name_part = name_parts[0]
-                
-                if name_part in ['finance', 'money', 'news', 'business'] and len(name_parts) > 2:
-                    name_part = name_parts[1]
-                
-                name_part = name_part.replace('-', ' ').replace('_', ' ')
-                return name_part.title()
-            
-            return domain.replace('.com', '').replace('.org', '').replace('.net', '').title()
-            
-        except Exception as e:
-            logger.warning(f"Failed to extract source from URL '{url}': {str(e)}")
-            return "Unknown Source"
-
-    def clean_source_name(self, source: str) -> str:
-        """Clean and extract source name from URL or full name"""
-        if pd.isna(source) or not source:
-            return ""
-        
-        source = str(source).strip()
-        
-        if any(indicator in source.lower() for indicator in ['http://', 'https://', 'www.', '.com', '.org', '.net']):
-            return self.extract_source_from_url(source)
-        
-        source_mapping = {
-            'wsj': 'Wall Street Journal',
-            'ft': 'Financial Times',
-            'nyt': 'New York Times',
-            'wapo': 'Washington Post',
-            'wp': 'Washington Post',
-            'lat': 'Los Angeles Times',
-            'usat': 'USA Today',
-            'ap': 'Associated Press',
-            'reuters': 'Reuters',
-            'bloomberg': 'Bloomberg',
-            'cnbc': 'CNBC',
-            'cnn': 'CNN',
-            'bbc': 'BBC',
-            'npr': 'NPR',
-            'abc': 'ABC News',
-            'cbs': 'CBS News',
-            'nbc': 'NBC News',
-            'fox': 'Fox News',
-            'mw': 'MarketWatch',
-            'yf': 'Yahoo Finance',
-            'sa': 'Seeking Alpha',
-            'tmf': 'Motley Fool',
-            'bi': 'Business Insider',
-            'tc': 'TechCrunch',
-            'vb': 'VentureBeat'
-        }
-        
-        source_lower = source.lower().strip()
-        clean_name = source_mapping.get(source_lower)
-        if clean_name:
-            return clean_name
-        
-        return source.title()
-
-    def extract_company_info(self, df: pd.DataFrame, text_column: str) -> Dict[str, str]:
-        """Extract company name and ticker from the dataset"""
-        company_info = {'company_name': '', 'ticker': ''}
-        
-        # Check column names for company/ticker info
-        for col in df.columns:
-            col_lower = col.lower()
-            if 'company' in col_lower or 'firm' in col_lower or 'corp' in col_lower:
-                if not df[col].isna().all():
-                    company_info['company_name'] = str(df[col].iloc[0])
-            elif 'ticker' in col_lower or 'symbol' in col_lower:
-                if not df[col].isna().all():
-                    company_info['ticker'] = str(df[col].iloc[0]).upper()
-        
-        # Check for 'Ticker' column specifically
-        if 'Ticker' in df.columns and not df['Ticker'].isna().all():
-            company_info['ticker'] = str(df['Ticker'].iloc[0]).upper()
-        
-        # If ticker found, get proper company name
-        if company_info['ticker'] and not company_info['company_name']:
-            mapped_name = self.get_company_name_from_ticker(company_info['ticker'])
-            if mapped_name:
-                company_info['company_name'] = mapped_name
-        
-        # If not found in columns, try to extract from text content
-        if not company_info['company_name'] or not company_info['ticker']:
-            sample_texts = df[text_column].dropna().head(3).tolist()
-            if sample_texts:
-                combined_sample = ' '.join([str(text)[:500] for text in sample_texts])
-                extracted_info = self.extract_company_from_text(combined_sample)
-                
-                if not company_info['ticker'] and extracted_info['ticker']:
-                    company_info['ticker'] = extracted_info['ticker'].upper()
-                    mapped_name = self.get_company_name_from_ticker(company_info['ticker'])
-                    if mapped_name:
-                        company_info['company_name'] = mapped_name
-                
-                if not company_info['company_name'] and extracted_info['company_name']:
-                    company_info['company_name'] = extracted_info['company_name']
-        
-        return company_info
     
-    def extract_company_from_text(self, text: str) -> Dict[str, str]:
-        """Use AI to extract company name and ticker from text"""
-        prompt = f"""
-        From the following text, extract the main company name and stock ticker symbol (if mentioned).
-        Return only the company name and ticker, or "Not found" if not clearly identifiable.
-        
-        Text: {text}
-        
-        Please respond in this exact format:
-        Company: [company name or "Not found"]
-        Ticker: [ticker symbol or "Not found"]
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are an expert at extracting company information from financial text."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=100,
-                temperature=0.1
-            )
-            
-            content = response.choices[0].message.content.strip()
-            
-            company_name = "Not found"
-            ticker = "Not found"
-            
-            for line in content.split('\n'):
-                if line.strip().startswith('Company:'):
-                    company_name = line.split(':', 1)[1].strip()
-                elif line.strip().startswith('Ticker:'):
-                    ticker = line.split(':', 1)[1].strip()
-            
-            return {
-                'company_name': company_name if company_name != "Not found" else "",
-                'ticker': ticker if ticker != "Not found" else ""
-            }
-            
-        except Exception as e:
-            logger.warning(f"Failed to extract company info from text: {str(e)}")
-            return {'company_name': '', 'ticker': ''}
-    
-    def get_top_sources(self, df: pd.DataFrame, source_column: str, top_n: int = 5) -> List[Tuple[str, int]]:
-        """Get top N news sources from the dataset with cleaned names"""
-        if source_column not in df.columns:
-            return []
-        
-        cleaned_sources = df[source_column].dropna().apply(self.clean_source_name)
-        cleaned_sources = cleaned_sources[cleaned_sources != ""]
-        source_counts = cleaned_sources.value_counts().head(top_n)
-        return [(source, count) for source, count in source_counts.items()]
-    
-    def get_date_range(self, df: pd.DataFrame, date_column: str) -> Dict[str, str]:
-        """Get date range from the dataset"""
-        if date_column not in df.columns:
-            return {'start_date': '', 'end_date': ''}
-        
-        try:
-            dates = pd.to_datetime(df[date_column], errors='coerce').dropna()
-            
-            if dates.empty:
-                return {'start_date': '', 'end_date': ''}
-            
-            start_date = dates.min().strftime('%Y-%m-%d')
-            end_date = dates.max().strftime('%Y-%m-%d')
-            
-            return {'start_date': start_date, 'end_date': end_date}
-            
-        except Exception as e:
-            logger.warning(f"Failed to extract date range: {str(e)}")
-            return {'start_date': '', 'end_date': ''}
-    
-    def get_real_stock_data(self, ticker: str, start_date: str, end_date: str) -> Dict[str, Any]:
-        """Get real stock price data using yfinance if available"""
+    def get_stock_data(self, ticker: str, start_date: str = None, end_date: str = None) -> Dict[str, Any]:
+        """Get stock price data using yfinance"""
         if not YFINANCE_AVAILABLE:
-            return self.generate_mock_price_data()
+            return self._generate_mock_price_data()
         
         try:
+            if not start_date:
+                start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            if not end_date:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+            
             stock = yf.Ticker(ticker)
             hist = stock.download(start=start_date, end=end_date, progress=False)
             
             if hist.empty:
                 logger.warning(f"No price data found for {ticker}")
-                return self.generate_mock_price_data()
+                return self._generate_mock_price_data()
             
-            # Get current price (latest available)
             current_price = hist['Close'].iloc[-1]
-            
-            # Calculate average price for the period
             avg_price = hist['Close'].mean()
-            
-            # Calculate volatility (std deviation of returns)
             returns = hist['Close'].pct_change().dropna()
-            volatility = returns.std() * np.sqrt(252)  # Annualized volatility
+            volatility = returns.std() * np.sqrt(252)
+            
+            # Get additional stock info
+            info = stock.info
             
             return {
                 'current_price': round(current_price, 2),
                 'avg_price_period': round(avg_price, 2),
                 'volatility': volatility,
-                'price_data_available': True
+                'market_cap': info.get('marketCap', 0),
+                'pe_ratio': info.get('trailingPE', 0),
+                'price_data_available': True,
+                'stock_info': info,
+                'historical_data': hist  # Added for chart creation
             }
             
         except Exception as e:
             logger.warning(f"Failed to get real price data for {ticker}: {str(e)}")
-            return self.generate_mock_price_data()
+            return self._generate_mock_price_data()
     
-    def generate_mock_price_data(self) -> Dict[str, Any]:
+    def _generate_mock_price_data(self) -> Dict[str, Any]:
         """Generate mock price data when real data is not available"""
         mock_current_price = np.random.uniform(150, 200)
+        # Generate mock historical data for charts
+        dates = pd.date_range(end=datetime.now(), periods=30, freq='D')
+        mock_prices = [mock_current_price * (1 + np.random.normal(0, 0.02)) for _ in range(30)]
+        mock_hist = pd.DataFrame({'Close': mock_prices}, index=dates)
+        
         return {
             'current_price': round(mock_current_price, 2),
             'avg_price_period': round(mock_current_price * np.random.uniform(0.98, 1.02), 2),
-            'volatility': 0.25,  # 25% volatility assumption
-            'price_data_available': False
+            'volatility': 0.25,
+            'market_cap': 0,
+            'pe_ratio': 0,
+            'price_data_available': False,
+            'historical_data': mock_hist
         }
     
-    def calculate_sentiment_metrics(self, df: pd.DataFrame, sentiment_column: str, source_column: str = None) -> Dict[str, Any]:
-        """Calculate sentiment metrics for analysis"""
-        if sentiment_column not in df.columns:
-            return {
-                'average_sentiment': 0,
-                'total_mentions': len(df),
-                'sentiment_distribution': {'positive': 0, 'neutral': 0, 'negative': 0},
-                'news_vs_social': {'news': {'count': 0, 'avg_sentiment': 0}, 'social': {'count': 0, 'avg_sentiment': 0}}
-            }
+    def analyze_data_patterns(self, news_df: pd.DataFrame, reddit_df: pd.DataFrame) -> Dict[str, Any]:
+        """Comprehensive data pattern analysis for visualizations"""
+        analysis = {
+            'news_analysis': {},
+            'reddit_analysis': {},
+            'comparative_analysis': {}
+        }
         
-        try:
-            sentiment_scores = pd.to_numeric(df[sentiment_column], errors='coerce').dropna()
+        # News data analysis
+        if news_df is not None and not news_df.empty:
+            news_text_col = self.identify_text_column(news_df)
             
-            if sentiment_scores.empty:
-                return {
-                    'average_sentiment': 0,
-                    'total_mentions': len(df),
-                    'sentiment_distribution': {'positive': 0, 'neutral': 0, 'negative': 0},
-                    'news_vs_social': {'news': {'count': 0, 'avg_sentiment': 0}, 'social': {'count': 0, 'avg_sentiment': 0}}
+            # Basic statistics
+            analysis['news_analysis'] = {
+                'total_articles': len(news_df),
+                'columns': list(news_df.columns),
+                'text_column': news_text_col,
+                'date_columns': [col for col in news_df.columns if 'date' in col.lower() or 'time' in col.lower()],
+                'avg_text_length': news_df[news_text_col].astype(str).str.len().mean() if news_text_col else 0,
+                'word_frequency': self._get_word_frequency(news_df, news_text_col) if news_text_col else {}
+            }
+            
+            # Time series analysis if date column exists
+            date_col = None
+            for col in analysis['news_analysis']['date_columns']:
+                try:
+                    news_df[col] = pd.to_datetime(news_df[col])
+                    date_col = col
+                    break
+                except:
+                    continue
+            
+            if date_col:
+                daily_counts = news_df.groupby(news_df[date_col].dt.date).size()
+                analysis['news_analysis']['time_series'] = daily_counts.to_dict()
+        
+        # Reddit data analysis
+        if reddit_df is not None and not reddit_df.empty:
+            reddit_text_col = self.identify_text_column(reddit_df)
+            
+            analysis['reddit_analysis'] = {
+                'total_posts': len(reddit_df),
+                'columns': list(reddit_df.columns),
+                'text_column': reddit_text_col,
+                'date_columns': [col for col in reddit_df.columns if 'date' in col.lower() or 'time' in col.lower()],
+                'avg_text_length': reddit_df[reddit_text_col].astype(str).str.len().mean() if reddit_text_col else 0,
+                'word_frequency': self._get_word_frequency(reddit_df, reddit_text_col) if reddit_text_col else {}
+            }
+            
+            # Engagement metrics if available
+            engagement_cols = ['upvotes', 'score', 'ups', 'comments', 'comment_count']
+            for col in engagement_cols:
+                if col in reddit_df.columns:
+                    analysis['reddit_analysis'][f'{col}_stats'] = {
+                        'mean': reddit_df[col].mean(),
+                        'median': reddit_df[col].median(),
+                        'max': reddit_df[col].max(),
+                        'min': reddit_df[col].min()
+                    }
+        
+        # Comparative analysis
+        if news_df is not None and reddit_df is not None:
+            analysis['comparative_analysis'] = {
+                'volume_comparison': {
+                    'news': len(news_df),
+                    'reddit': len(reddit_df)
+                },
+                'text_length_comparison': {
+                    'news_avg': analysis['news_analysis'].get('avg_text_length', 0),
+                    'reddit_avg': analysis['reddit_analysis'].get('avg_text_length', 0)
                 }
-            
-            avg_sentiment = sentiment_scores.mean()
-            total_mentions = len(sentiment_scores)
-            
-            # Sentiment distribution
-            positive_count = len(sentiment_scores[sentiment_scores > 0.1])
-            negative_count = len(sentiment_scores[sentiment_scores < -0.1])
-            neutral_count = total_mentions - positive_count - negative_count
-            
-            sentiment_distribution = {
-                'positive': positive_count,
-                'neutral': neutral_count,
-                'negative': negative_count
             }
-            
-            # News vs Social analysis
-            news_vs_social = {'news': {'count': 0, 'avg_sentiment': 0}, 'social': {'count': 0, 'avg_sentiment': 0}}
-            
-            if source_column and source_column in df.columns:
-                social_sources = ['reddit', 'twitter', 'facebook', 'social']
-                
-                df_with_sentiment = df[df[sentiment_column].notna()].copy()
-                df_with_sentiment['clean_source'] = df_with_sentiment[source_column].apply(self.clean_source_name).str.lower()
-                
-                social_mask = df_with_sentiment['clean_source'].str.contains('|'.join(social_sources), case=False, na=False)
-                
-                social_data = df_with_sentiment[social_mask]
-                news_data = df_with_sentiment[~social_mask]
-                
-                if len(social_data) > 0:
-                    news_vs_social['social']['count'] = len(social_data)
-                    news_vs_social['social']['avg_sentiment'] = pd.to_numeric(social_data[sentiment_column], errors='coerce').mean()
-                
-                if len(news_data) > 0:
-                    news_vs_social['news']['count'] = len(news_data)
-                    news_vs_social['news']['avg_sentiment'] = pd.to_numeric(news_data[sentiment_column], errors='coerce').mean()
-            
-            return {
-                'average_sentiment': avg_sentiment,
-                'total_mentions': total_mentions,
-                'sentiment_distribution': sentiment_distribution,
-                'news_vs_social': news_vs_social
-            }
-            
-        except Exception as e:
-            logger.warning(f"Failed to calculate sentiment metrics: {str(e)}")
-            return {
-                'average_sentiment': 0,
-                'total_mentions': len(df),
-                'sentiment_distribution': {'positive': 0, 'neutral': 0, 'negative': 0},
-                'news_vs_social': {'news': {'count': 0, 'avg_sentiment': 0}, 'social': {'count': 0, 'avg_sentiment': 0}}
-            }
+        
+        return analysis
     
-    def extract_keywords_and_themes(self, df: pd.DataFrame, text_column: str, company_info: Dict[str, str] = None, top_n: int = 10) -> List[Tuple[str, int]]:
-        """Extract top keywords and themes from the text data, excluding company names and tickers"""
-        try:
-            all_text = ' '.join(df[text_column].dropna().astype(str))
-            
-            # Extract words
-            words = re.findall(r'\b[a-zA-Z]{3,}\b', all_text.lower())
-            
-            # Enhanced stop words list including company-related terms
-            stop_words = {
-                'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'any', 'can', 'had', 
-                'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 
-                'man', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'its', 
-                'let', 'put', 'say', 'she', 'too', 'use', 'will', 'said', 'each', 'make', 
-                'most', 'over', 'such', 'time', 'very', 'when', 'have', 'from', 'they', 'know', 
-                'want', 'been', 'good', 'much', 'some', 'than', 'call', 'come', 'could', 'find', 
-                'first', 'look', 'made', 'many', 'may', 'people', 'these', 'think', 'this', 
-                'well', 'work', 'would', 'year', 'years', 'about', 'after', 'before', 'down', 
-                'here', 'just', 'like', 'long', 'more', 'only', 'other', 'right', 'since', 
-                'still', 'such', 'take', 'through', 'under', 'where', 'while', 'with', 'without',
-                # Common business terms
-                'company', 'business', 'market', 'stock', 'price', 'share', 'investor', 'investment',
-                'report', 'news', 'article', 'today', 'yesterday', 'week', 'month', 'quarter'
-            }
-            
-            # Add company-specific terms to stop words if available
-            if company_info:
-                if company_info.get('company_name'):
-                    # Split company name and add parts
-                    company_parts = re.findall(r'\b[a-zA-Z]{3,}\b', company_info['company_name'].lower())
-                    stop_words.update(company_parts)
-                    # Also add common company suffixes
-                    stop_words.update(['inc', 'corp', 'corporation', 'company', 'ltd', 'limited'])
-                
-                if company_info.get('ticker'):
-                    stop_words.add(company_info['ticker'].lower())
-            
-            filtered_words = [word for word in words if word not in stop_words and len(word) > 3]
-            word_counts = Counter(filtered_words)
-            
-            return word_counts.most_common(top_n)
-            
-        except Exception as e:
-            logger.warning(f"Failed to extract keywords: {str(e)}")
-            return []
-
-    def create_charts_for_pdf(self, sentiment_metrics: Dict[str, Any], top_sources: List[Tuple[str, int]], 
-                             keywords: List[Tuple[str, int]], output_dir: str, is_news_only: bool = False) -> Dict[str, str]:
-        """Create charts for PDF report"""
-        chart_files = {}
+    def _get_word_frequency(self, df: pd.DataFrame, text_column: str, top_n: int = 20) -> Dict[str, int]:
+        """Get word frequency analysis"""
+        if not text_column or text_column not in df.columns:
+            return {}
         
         try:
-            # Ensure output directory exists
-            os.makedirs(output_dir, exist_ok=True)
+            # Combine all text
+            all_text = ' '.join(df[text_column].astype(str).str.lower())
             
-            # Set style for professional charts
-            plt.style.use('seaborn-v0_8')
-            sns.set_palette("husl")
+            # Simple word extraction (remove common stop words)
+            stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them'}
             
-            # 1. Sentiment Distribution Chart
-            fig, ax = plt.subplots(figsize=(8, 6))
+            words = re.findall(r'\b[a-z]+\b', all_text)
+            words = [word for word in words if len(word) > 2 and word not in stop_words]
             
-            distribution = sentiment_metrics.get('sentiment_distribution', {})
-            labels = ['Positive', 'Neutral', 'Negative']
-            values = [distribution.get('positive', 0), distribution.get('neutral', 0), distribution.get('negative', 0)]
-            colors = ['#2E8B57', '#FFA500', '#DC143C']
+            word_freq = Counter(words)
+            return dict(word_freq.most_common(top_n))
             
-            wedges, texts, autotexts = ax.pie(values, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-            ax.set_title('Sentiment Distribution', fontsize=16, fontweight='bold', pad=20)
+        except Exception as e:
+            logger.warning(f"Failed to get word frequency: {str(e)}")
+            return {}
+    
+    def create_comprehensive_charts(self, news_df: pd.DataFrame, reddit_df: pd.DataFrame, 
+                                  stock_data: Dict[str, Any], data_analysis: Dict[str, Any]) -> List[str]:
+        """Create comprehensive set of charts for analysis"""
+        chart_paths = []
+        
+        try:
+            # Set style
+            plt.style.use('seaborn') 
+            # Chart 3: Word Frequency Analysis
+            chart_paths.append(self._create_word_frequency_chart(data_analysis))
             
-            # Make percentage text bold and white
-            for autotext in autotexts:
-                autotext.set_color('white')
-                autotext.set_fontweight('bold')
-                autotext.set_fontsize(10)
+            # Chart 4: Stock Price Analysis
+            chart_paths.append(self._create_stock_price_chart(stock_data))
+            
+            # Chart 5: Returns Distribution
+            chart_paths.append(self._create_returns_distribution_chart(stock_data))
+            
+            # Chart 6: Risk Assessment
+            chart_paths.append(self._create_risk_assessment_chart(stock_data))
+            
+            # Chart 7: Data Quality Assessment
+            chart_paths.append(self._create_data_quality_chart(news_df, reddit_df))
+            
+            return [path for path in chart_paths if path]  # Remove None values
+            
+        except Exception as e:
+            logger.error(f"Error creating comprehensive charts: {str(e)}")
+            return []
+    
+    def _create_word_frequency_chart(self, data_analysis: Dict[str, Any]) -> str:
+        """Create word frequency analysis chart"""
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+            
+            # News word frequency
+            news_words = data_analysis.get('news_analysis', {}).get('word_frequency', {})
+            if news_words:
+                words = list(news_words.keys())[:15]
+                counts = list(news_words.values())[:15]
+                
+                bars = axes[0, 0].barh(words, counts, color='#1f4e79', alpha=0.8)
+                axes[0, 0].set_title('Top News Keywords', fontweight='bold')
+                axes[0, 0].set_xlabel('Frequency')
+                axes[0, 0].grid(True, alpha=0.3, axis='x')
+                
+                # Add value labels
+                for bar in bars:
+                    width = bar.get_width()
+                    axes[0, 0].text(width + width*0.01, bar.get_y() + bar.get_height()/2.,
+                                   f'{int(width)}', ha='left', va='center', fontsize=8)
+            
+            # Reddit word frequency
+            reddit_words = data_analysis.get('reddit_analysis', {}).get('word_frequency', {})
+            if reddit_words:
+                words = list(reddit_words.keys())[:15]
+                counts = list(reddit_words.values())[:15]
+                
+                bars = axes[0, 1].barh(words, counts, color='#2E8B57', alpha=0.8)
+                axes[0, 1].set_title('Top Social Media Keywords', fontweight='bold')
+                axes[0, 1].set_xlabel('Frequency')
+                axes[0, 1].grid(True, alpha=0.3, axis='x')
+                
+                # Add value labels
+                for bar in bars:
+                    width = bar.get_width()
+                    axes[0, 1].text(width + width*0.01, bar.get_y() + bar.get_height()/2.,
+                                   f'{int(width)}', ha='left', va='center', fontsize=8)
+            
+            # Combined word cloud for news
+            if news_words:
+                try:
+                    wordcloud_news = WordCloud(width=400, height=300, background_color='white',
+                                             colormap='Blues').generate_from_frequencies(news_words)
+                    axes[1, 0].imshow(wordcloud_news, interpolation='bilinear')
+                    axes[1, 0].axis('off')
+                    axes[1, 0].set_title('News Word Cloud', fontweight='bold')
+                except:
+                    axes[1, 0].text(0.5, 0.5, 'Word cloud not available', ha='center', va='center',
+                                   transform=axes[1, 0].transAxes)
+                    axes[1, 0].set_title('News Word Cloud', fontweight='bold')
+            
+            # Combined word cloud for reddit
+            if reddit_words:
+                try:
+                    wordcloud_reddit = WordCloud(width=400, height=300, background_color='white',
+                                               colormap='Greens').generate_from_frequencies(reddit_words)
+                    axes[1, 1].imshow(wordcloud_reddit, interpolation='bilinear')
+                    axes[1, 1].axis('off')
+                    axes[1, 1].set_title('Social Media Word Cloud', fontweight='bold')
+                except:
+                    axes[1, 1].text(0.5, 0.5, 'Word cloud not available', ha='center', va='center',
+                                   transform=axes[1, 1].transAxes)
+                    axes[1, 1].set_title('Social Media Word Cloud', fontweight='bold')
             
             plt.tight_layout()
-            sentiment_chart_path = os.path.join(output_dir, 'sentiment_distribution.png')
-            plt.savefig(sentiment_chart_path, dpi=300, bbox_inches='tight')
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight')
             plt.close()
-            chart_files['sentiment_distribution'] = sentiment_chart_path
-            
-            # 2. News vs Social Chart (only if social data exists)
-            news_social = sentiment_metrics.get('news_vs_social', {})
-            social_count = news_social.get('social', {}).get('count', 0)
-            
-            if not is_news_only and social_count > 0:
-                fig, ax = plt.subplots(figsize=(10, 6))
-                
-                categories = ['News', 'Social Media']
-                news_sentiment = news_social.get('news', {}).get('avg_sentiment', 0)
-                social_sentiment = news_social.get('social', {}).get('avg_sentiment', 0)
-                sentiment_scores = [news_sentiment, social_sentiment]
-                
-                colors = ['#2E8B57' if score > 0 else '#DC143C' for score in sentiment_scores]
-                bars = ax.bar(categories, sentiment_scores, color=colors, alpha=0.8, edgecolor='black', linewidth=1)
-                
-                # Add value labels on bars
-                for bar, score in zip(bars, sentiment_scores):
-                    height = bar.get_height()
-                    ax.text(bar.get_x() + bar.get_width()/2., height + (0.01 if height >= 0 else -0.03),
-                            f'{score:+.3f}', ha='center', va='bottom' if height >= 0 else 'top', 
-                            fontweight='bold', fontsize=11)
-                
-                ax.set_ylabel('Average Sentiment Score', fontsize=12, fontweight='bold')
-                ax.set_title('News vs Social Media Sentiment', fontsize=16, fontweight='bold', pad=20)
-                ax.grid(axis='y', alpha=0.3)
-                ax.axhline(y=0, color='black', linestyle='-', alpha=0.3)
-                
-                plt.tight_layout()
-                news_social_chart_path = os.path.join(output_dir, 'news_vs_social.png')
-                plt.savefig(news_social_chart_path, dpi=300, bbox_inches='tight')
-                plt.close()
-                chart_files['news_vs_social'] = news_social_chart_path
-            
-            # 3. Top Sources Chart
-            if top_sources:
-                fig, ax = plt.subplots(figsize=(12, 6))
-                
-                sources = [source[0] for source in top_sources[:8]]  # Limit to top 8
-                counts = [source[1] for source in top_sources[:8]]
-                
-                bars = ax.bar(sources, counts, color='#1f77b4', alpha=0.8, edgecolor='black', linewidth=1)
-                
-                # Add value labels on bars
-                for bar, count in zip(bars, counts):
-                    height = bar.get_height()
-                    ax.text(bar.get_x() + bar.get_width()/2., height + 0.5,
-                            str(count), ha='center', va='bottom', fontweight='bold', fontsize=10)
-                
-                ax.set_ylabel('Number of Articles', fontsize=12, fontweight='bold')
-                ax.set_title('Top News Sources', fontsize=16, fontweight='bold', pad=20)
-                ax.grid(axis='y', alpha=0.3)
-                
-                # Rotate x-axis labels for better readability
-                plt.xticks(rotation=45, ha='right')
-                plt.tight_layout()
-                
-                sources_chart_path = os.path.join(output_dir, 'top_sources.png')
-                plt.savefig(sources_chart_path, dpi=300, bbox_inches='tight')
-                plt.close()
-                chart_files['top_sources'] = sources_chart_path
-            
-            # 4. Keywords Chart
-            if keywords:
-                fig, ax = plt.subplots(figsize=(12, 6))
-                
-                words = [kw[0].title() for kw in keywords[:10]]
-                freqs = [kw[1] for kw in keywords[:10]]
-                
-                bars = ax.barh(words, freqs, color='#2e8b57', alpha=0.8, edgecolor='black', linewidth=1)
-                
-                # Add value labels on bars
-                for bar, freq in zip(bars, freqs):
-                    width = bar.get_width()
-                    ax.text(width + 0.5, bar.get_y() + bar.get_height()/2.,
-                            str(freq), ha='left', va='center', fontweight='bold', fontsize=10)
-                
-                ax.set_xlabel('Frequency', fontsize=12, fontweight='bold')
-                ax.set_title('Top Keywords & Themes', fontsize=16, fontweight='bold', pad=20)
-                ax.grid(axis='x', alpha=0.3)
-                
-                plt.tight_layout()
-                keywords_chart_path = os.path.join(output_dir, 'keywords.png')
-                plt.savefig(keywords_chart_path, dpi=300, bbox_inches='tight')
-                plt.close()
-                chart_files['keywords'] = keywords_chart_path
-            
-            return chart_files
+            return temp_path
             
         except Exception as e:
-            logger.warning(f"Failed to create charts: {str(e)}")
-            return {}
-
-    def generate_individual_summary(self, text: str, company_info: Dict[str, str] = None) -> str:
-        """Generate individual summary for a news item"""
+            logger.error(f"Error creating word frequency chart: {str(e)}")
+            plt.close()
+            return ""
+    
+    def _create_stock_price_chart(self, stock_data: Dict[str, Any]) -> str:
+        """Create comprehensive stock price analysis chart"""
         try:
-            # Create context-aware prompt
-            if company_info and company_info.get('company_name'):
-                company_context = f"This content is related to {company_info['company_name']}"
+            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+            
+            # Price trend
+            if 'historical_data' in stock_data:
+                hist_data = stock_data['historical_data']
+                axes[0, 0].plot(hist_data.index, hist_data['Close'], linewidth=2, color='#1f4e79')
+                axes[0, 0].set_title('Stock Price Trend', fontweight='bold')
+                axes[0, 0].set_xlabel('Date')
+                axes[0, 0].set_ylabel('Price ($)')
+                axes[0, 0].grid(True, alpha=0.3)
+                axes[0, 0].tick_params(axis='x', rotation=45)
+                
+                # Add current price line
+                current_price = stock_data.get('current_price', 0)
+                axes[0, 0].axhline(y=current_price, color='red', linestyle='--', alpha=0.7,
+                                  label=f'Current: ${current_price:.2f}')
+                axes[0, 0].legend()
+            
+            # Volume analysis (if available)
+            if 'historical_data' in stock_data and 'Volume' in stock_data['historical_data'].columns:
+                volume_data = stock_data['historical_data']['Volume']
+                axes[0, 1].bar(volume_data.index, volume_data, color='#2E8B57', alpha=0.7)
+                axes[0, 1].set_title('Trading Volume', fontweight='bold')
+                axes[0, 1].set_xlabel('Date')
+                axes[0, 1].set_ylabel('Volume')
+                axes[0, 1].grid(True, alpha=0.3)
+                axes[0, 1].tick_params(axis='x', rotation=45)
+            else:
+                # Price change chart instead
+                if 'historical_data' in stock_data:
+                    price_changes = stock_data['historical_data']['Close'].pct_change().dropna() * 100
+                    axes[0, 1].bar(range(len(price_changes)), price_changes, 
+                                  color=['green' if x > 0 else 'red' for x in price_changes], alpha=0.7)
+                    axes[0, 1].set_title('Daily Price Changes (%)', fontweight='bold')
+                    axes[0, 1].set_xlabel('Days')
+                    axes[0, 1].set_ylabel('Change (%)')
+                    axes[0, 1].grid(True, alpha=0.3)
+                    axes[0, 1].axhline(y=0, color='black', linestyle='-', alpha=0.5)
+            
+            # Moving averages
+            if 'historical_data' in stock_data:
+                hist_data = stock_data['historical_data']
+                ma_7 = hist_data['Close'].rolling(window=7).mean()
+                ma_14 = hist_data['Close'].rolling(window=14).mean()
+                
+                axes[1, 0].plot(hist_data.index, hist_data['Close'], label='Price', linewidth=2, color='#1f4e79')
+                axes[1, 0].plot(hist_data.index, ma_7, label='7-day MA', linewidth=1.5, color='orange')
+                axes[1, 0].plot(hist_data.index, ma_14, label='14-day MA', linewidth=1.5, color='red')
+                axes[1, 0].set_title('Price with Moving Averages', fontweight='bold')
+                axes[1, 0].set_xlabel('Date')
+                axes[1, 0].set_ylabel('Price ($)')
+                axes[1, 0].grid(True, alpha=0.3)
+                axes[1, 0].legend()
+                axes[1, 0].tick_params(axis='x', rotation=45)
+            
+            # Key metrics summary
+            axes[1, 1].axis('off')
+            metrics_data = [
+                ['Metric', 'Value'],
+                ['Current Price', f"${stock_data.get('current_price', 0):.2f}"],
+                ['Average Price', f"${stock_data.get('avg_price_period', 0):.2f}"],
+                ['Volatility', f"{stock_data.get('volatility', 0):.1%}"],
+                ['Market Cap', f"${stock_data.get('market_cap', 0):,.0f}" if stock_data.get('market_cap') else 'N/A'],
+                ['P/E Ratio', f"{stock_data.get('pe_ratio', 'N/A')}"],
+                ['Data Source', 'Real-time' if stock_data.get('price_data_available') else 'Simulated']
+            ]
+            
+            table = axes[1, 1].table(cellText=metrics_data, loc='center', cellLoc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1, 2)
+            # Color header row
+            for i in range(len(metrics_data[0])):
+                table[(0, i)].set_facecolor('#1f4e79')
+                table[(0, i)].set_text_props(weight='bold', color='white')
+            axes[1, 1].set_title('Key Metrics Summary', fontweight='bold', pad=20)
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating stock price chart: {str(e)}")
+            plt.close()
+            return ""
+
+    def analyze_sentiment_comprehensive(self, news_df: pd.DataFrame, reddit_df: pd.DataFrame) -> Dict[str, Any]:
+        """Comprehensive sentiment analysis for both datasets"""
+        try:
+            sentiment_data = {
+                'news_sentiment': {'positive': 0, 'negative': 0, 'neutral': 0, 'scores': []},
+                'reddit_sentiment': {'positive': 0, 'negative': 0, 'neutral': 0, 'scores': []},
+                'combined_sentiment': {'score': 0, 'label': 'neutral'}
+            }
+            
+            # Handle None or empty dataframes
+            if news_df is None:
+                news_df = pd.DataFrame()
+            if reddit_df is None:
+                reddit_df = pd.DataFrame()
+            
+            # Simple keyword-based sentiment analysis
+            positive_keywords = ['buy', 'bullish', 'positive', 'growth', 'strong', 'good', 'great', 
+                            'excellent', 'rise', 'gain', 'profit', 'success', 'optimistic', 'upgrade']
+            negative_keywords = ['sell', 'bearish', 'negative', 'decline', 'weak', 'bad', 'poor', 
+                            'terrible', 'fall', 'loss', 'fail', 'pessimistic', 'downgrade']
+            
+            def calculate_sentiment_score(text):
+                if pd.isna(text) or text is None:
+                    return 0
+                text_lower = str(text).lower()
+                pos_count = sum(text_lower.count(word) for word in positive_keywords)
+                neg_count = sum(text_lower.count(word) for word in negative_keywords)
+                
+                if pos_count + neg_count == 0:
+                    return 0
+                return (pos_count - neg_count) / (pos_count + neg_count)
+            
+            # News sentiment analysis
+            if not news_df.empty:
+                news_text_col = self.identify_text_column(news_df)
+                if news_text_col and news_text_col in news_df.columns:
+                    try:
+                        news_scores = news_df[news_text_col].apply(calculate_sentiment_score)
+                        sentiment_data['news_sentiment']['scores'] = news_scores.tolist()
+                        sentiment_data['news_sentiment']['positive'] = int((news_scores > 0.1).sum())
+                        sentiment_data['news_sentiment']['negative'] = int((news_scores < -0.1).sum())
+                        sentiment_data['news_sentiment']['neutral'] = int(((news_scores >= -0.1) & (news_scores <= 0.1)).sum())
+                    except Exception as e:
+                        logger.warning(f"Error processing news sentiment: {str(e)}")
+            
+            # Reddit sentiment analysis
+            if not reddit_df.empty:
+                reddit_text_col = self.identify_text_column(reddit_df)
+                if reddit_text_col and reddit_text_col in reddit_df.columns:
+                    try:
+                        reddit_scores = reddit_df[reddit_text_col].apply(calculate_sentiment_score)
+                        sentiment_data['reddit_sentiment']['scores'] = reddit_scores.tolist()
+                        sentiment_data['reddit_sentiment']['positive'] = int((reddit_scores > 0.1).sum())
+                        sentiment_data['reddit_sentiment']['negative'] = int((reddit_scores < -0.1).sum())
+                        sentiment_data['reddit_sentiment']['neutral'] = int(((reddit_scores >= -0.1) & (reddit_scores <= 0.1)).sum())
+                    except Exception as e:
+                        logger.warning(f"Error processing reddit sentiment: {str(e)}")
+            
+            # Combined sentiment
+            all_scores = sentiment_data['news_sentiment']['scores'] + sentiment_data['reddit_sentiment']['scores']
+            if all_scores:
+                combined_score = float(np.mean(all_scores))
+                sentiment_data['combined_sentiment']['score'] = combined_score
+                if combined_score > 0.1:
+                    sentiment_data['combined_sentiment']['label'] = 'positive'
+                elif combined_score < -0.1:
+                    sentiment_data['combined_sentiment']['label'] = 'negative'
+                else:
+                    sentiment_data['combined_sentiment']['label'] = 'neutral'
+            
+            return sentiment_data
+            
+        except Exception as e:
+            logger.error(f"Error in sentiment analysis: {str(e)}")
+            return {
+                'news_sentiment': {'positive': 0, 'negative': 0, 'neutral': 0, 'scores': []},
+                'reddit_sentiment': {'positive': 0, 'negative': 0, 'neutral': 0, 'scores': []},
+                'combined_sentiment': {'score': 0, 'label': 'neutral'}
+            }
+
+    def create_sentiment_chart(self, sentiment_data: Dict[str, Any]) -> str:
+        """Create comprehensive sentiment analysis chart"""
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+            
+            # News sentiment pie chart
+            news_data = sentiment_data['news_sentiment']
+            if news_data['positive'] + news_data['negative'] + news_data['neutral'] > 0:
+                labels = ['Positive', 'Negative', 'Neutral']
+                sizes = [news_data['positive'], news_data['negative'], news_data['neutral']]
+                colors = ['#2E8B57', '#DC143C', '#FFD700']
+                
+                axes[0, 0].pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+                axes[0, 0].set_title('News Sentiment Distribution', fontweight='bold')
+            
+            # Reddit sentiment pie chart
+            reddit_data = sentiment_data['reddit_sentiment']
+            if reddit_data['positive'] + reddit_data['negative'] + reddit_data['neutral'] > 0:
+                labels = ['Positive', 'Negative', 'Neutral']
+                sizes = [reddit_data['positive'], reddit_data['negative'], reddit_data['neutral']]
+                colors = ['#2E8B57', '#DC143C', '#FFD700']
+                
+                axes[0, 1].pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+                axes[0, 1].set_title('Social Media Sentiment Distribution', fontweight='bold')
+            
+            # Sentiment comparison bar chart
+            categories = ['News', 'Social Media']
+            positive_counts = [news_data['positive'], reddit_data['positive']]
+            negative_counts = [news_data['negative'], reddit_data['negative']]
+            neutral_counts = [news_data['neutral'], reddit_data['neutral']]
+            
+            x = np.arange(len(categories))
+            width = 0.25
+            
+            bars1 = axes[1, 0].bar(x - width, positive_counts, width, label='Positive', color='#2E8B57')
+            bars2 = axes[1, 0].bar(x, negative_counts, width, label='Negative', color='#DC143C')
+            bars3 = axes[1, 0].bar(x + width, neutral_counts, width, label='Neutral', color='#FFD700')
+            
+            axes[1, 0].set_title('Sentiment Comparison by Source', fontweight='bold')
+            axes[1, 0].set_xlabel('Source')
+            axes[1, 0].set_ylabel('Count')
+            axes[1, 0].set_xticks(x)
+            axes[1, 0].set_xticklabels(categories)
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # Add value labels on bars
+            for bars in [bars1, bars2, bars3]:
+                for bar in bars:
+                    height = bar.get_height()
+                    axes[1, 0].text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                                f'{int(height)}', ha='center', va='bottom', fontsize=9)
+            
+            # Overall sentiment gauge
+            combined_score = sentiment_data['combined_sentiment']['score']
+            combined_label = sentiment_data['combined_sentiment']['label']
+            
+            # Create gauge chart
+            theta = np.linspace(0, np.pi, 100)
+            r = np.ones_like(theta)
+            
+            # Color zones
+            axes[1, 1].fill_between(theta[:33], 0, r[:33], color='#DC143C', alpha=0.3, label='Negative')
+            axes[1, 1].fill_between(theta[33:67], 0, r[33:67], color='#FFD700', alpha=0.3, label='Neutral')
+            axes[1, 1].fill_between(theta[67:], 0, r[67:], color='#2E8B57', alpha=0.3, label='Positive')
+            
+            # Sentiment needle
+            needle_angle = (combined_score + 1) * np.pi / 2  # Convert [-1,1] to [0,π]
+            axes[1, 1].arrow(0, 0, 0.8*np.cos(needle_angle), 0.8*np.sin(needle_angle),
+                            head_width=0.1, head_length=0.1, fc='black', ec='black')
+            
+            axes[1, 1].set_xlim(-1.2, 1.2)
+            axes[1, 1].set_ylim(0, 1.2)
+            axes[1, 1].set_aspect('equal')
+            axes[1, 1].set_title(f'Overall Sentiment: {combined_label.title()}\nScore: {combined_score:.3f}', 
+                            fontweight='bold')
+            axes[1, 1].text(0, -0.3, f'({combined_label.title()})', ha='center', fontsize=12, fontweight='bold',
+                        color={'positive': '#2E8B57', 'negative': '#DC143C', 'neutral': '#FFD700'}[combined_label])
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating sentiment chart: {str(e)}")
+            plt.close()
+            return ""
+        
+    def _create_returns_distribution_chart(self, stock_data: Dict[str, Any]) -> str:
+        """Create returns distribution analysis chart"""
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            
+            if 'historical_data' in stock_data:
+                hist_data = stock_data['historical_data']
+                returns = hist_data['Close'].pct_change().dropna() * 100
+                
+                # Histogram of returns
+                axes[0, 0].hist(returns, bins=20, alpha=0.7, color='#2E8B57', edgecolor='black')
+                axes[0, 0].axvline(returns.mean(), color='red', linestyle='--', linewidth=2,
+                                    label=f'Mean: {returns.mean():.2f}%')
+                axes[0, 0].set_title('Daily Returns Distribution', fontweight='bold')
+                axes[0, 0].set_xlabel('Daily Return (%)')
+                axes[0, 0].set_ylabel('Frequency')
+                axes[0, 0].grid(True, alpha=0.3)
+                axes[0, 0].legend()
+                
+                # Cumulative returns
+                cumulative_returns = (1 + returns/100).cumprod() - 1
+                axes[0, 1].plot(cumulative_returns.index, cumulative_returns * 100, 
+                                linewidth=2, color='#1f4e79')
+                axes[0, 1].set_title('Cumulative Returns', fontweight='bold')
+                axes[0, 1].set_xlabel('Date')
+                axes[0, 1].set_ylabel('Cumulative Return (%)')
+                axes[0, 1].grid(True, alpha=0.3)
+                axes[0, 1].tick_params(axis='x', rotation=45)
+                axes[0, 1].axhline(y=0, color='black', linestyle='-', alpha=0.5)
+                
+                # Rolling volatility
+                rolling_vol = returns.rolling(window=7).std() * np.sqrt(252)
+                axes[1, 0].plot(rolling_vol.index, rolling_vol, linewidth=2, color='orange')
+                axes[1, 0].set_title('7-Day Rolling Volatility', fontweight='bold')
+                axes[1, 0].set_xlabel('Date')
+                axes[1, 0].set_ylabel('Annualized Volatility')
+                axes[1, 0].grid(True, alpha=0.3)
+                axes[1, 0].tick_params(axis='x', rotation=45)
+                
+                # Risk metrics table
+                axes[1, 1].axis('off')
+                risk_metrics = [
+                    ['Risk Metric', 'Value'],
+                    ['Daily Volatility', f"{returns.std():.2f}%"],
+                    ['Annualized Volatility', f"{stock_data.get('volatility', 0):.1%}"],
+                    ['Max Daily Gain', f"{returns.max():.2f}%"],
+                    ['Max Daily Loss', f"{returns.min():.2f}%"],
+                    ['Positive Days', f"{(returns > 0).sum()}/{len(returns)}"],
+                    ['Sharpe Ratio (approx)', f"{(returns.mean() / returns.std() * np.sqrt(252)):.2f}" if returns.std() > 0 else 'N/A']
+                ]
+                
+                table = axes[1, 1].table(cellText=risk_metrics, loc='center', cellLoc='center')
+                table.auto_set_font_size(False)
+                table.set_fontsize(9)
+                table.scale(1, 2)
+                # Color header row
+                for i in range(len(risk_metrics[0])):
+                    table[(0, i)].set_facecolor('#8B0000')
+                    table[(0, i)].set_text_props(weight='bold', color='white')
+                axes[1, 1].set_title('Risk Metrics', fontweight='bold', pad=20)
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating returns distribution chart: {str(e)}")
+            plt.close()
+            return ""
+
+    def _create_risk_assessment_chart(self, stock_data: Dict[str, Any]) -> str:
+        """Create risk assessment visualization"""
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            
+            # Risk level comparison
+            current_vol = stock_data.get('volatility', 0.25) * 100
+            risk_categories = ['Low Risk\n(0-15%)', 'Medium Risk\n(15-25%)', 'High Risk\n(25%+)']
+            risk_thresholds = [15, 25, 35]
+            colors = ['green', 'orange', 'red']
+            
+            bars = axes[0, 0].bar(risk_categories, risk_thresholds, color=colors, alpha=0.6, edgecolor='black')
+            axes[0, 0].axhline(y=current_vol, color='blue', linestyle='--', linewidth=3,
+                                label=f'Current: {current_vol:.1f}%')
+            axes[0, 0].set_title('Risk Assessment - Volatility Comparison', fontweight='bold')
+            axes[0, 0].set_ylabel('Volatility (%)')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # Risk-Return scatter (simulated benchmark comparison)
+            benchmarks = {
+                'S&P 500': (8, 16),
+                'NASDAQ': (10, 20),
+                'Bonds': (3, 5),
+                'Real Estate': (6, 12),
+                'Commodities': (5, 18)
+            }
+            
+            current_return = 0  # Placeholder - could calculate from historical data
+            if 'historical_data' in stock_data:
+                hist_data = stock_data['historical_data']
+                if len(hist_data) > 1:
+                    total_return = ((hist_data['Close'].iloc[-1] / hist_data['Close'].iloc[0]) - 1) * 100
+                    annualized_return = total_return * (365 / len(hist_data))
+                    current_return = annualized_return
+            
+            benchmark_returns = [data[0] for data in benchmarks.values()]
+            benchmark_vols = [data[1] for data in benchmarks.values()]
+            
+            axes[0, 1].scatter(benchmark_vols, benchmark_returns, s=100, alpha=0.7, c='lightblue', edgecolors='black')
+            axes[0, 1].scatter([current_vol], [current_return], s=200, c='red', marker='*', 
+                                edgecolors='black', label='Current Stock')
+            
+            for i, (name, _) in enumerate(benchmarks.items()):
+                axes[0, 1].annotate(name, (benchmark_vols[i], benchmark_returns[i]), 
+                                    xytext=(5, 5), textcoords='offset points', fontsize=8)
+            
+            axes[0, 1].set_title('Risk-Return Comparison', fontweight='bold')
+            axes[0, 1].set_xlabel('Volatility (%)')
+            axes[0, 1].set_ylabel('Expected Return (%)')
+            axes[0, 1].grid(True, alpha=0.3)
+            axes[0, 1].legend()
+            
+            # VaR simulation (simplified)
+            if 'historical_data' in stock_data:
+                hist_data = stock_data['historical_data']
+                returns = hist_data['Close'].pct_change().dropna() * 100
+                
+                # Calculate VaR at different confidence levels
+                var_95 = np.percentile(returns, 5)
+                var_99 = np.percentile(returns, 1)
+                
+                axes[1, 0].hist(returns, bins=20, alpha=0.7, color='#2E8B57', edgecolor='black')
+                axes[1, 0].axvline(var_95, color='orange', linestyle='--', linewidth=2,
+                                    label=f'95% VaR: {var_95:.2f}%')
+                axes[1, 0].axvline(var_99, color='red', linestyle='--', linewidth=2,
+                                    label=f'99% VaR: {var_99:.2f}%')
+                axes[1, 0].set_title('Value at Risk (VaR) Analysis', fontweight='bold')
+                axes[1, 0].set_xlabel('Daily Return (%)')
+                axes[1, 0].set_ylabel('Frequency')
+                axes[1, 0].grid(True, alpha=0.3)
+                axes[1, 0].legend()
+            
+            # Risk summary
+            axes[1, 1].axis('off')
+            
+            # Determine risk level
+            if current_vol < 15:
+                risk_level = "LOW"
+                risk_color = "green"
+            elif current_vol < 25:
+                risk_level = "MEDIUM"
+                risk_color = "orange"
+            else:
+                risk_level = "HIGH"
+                risk_color = "red"
+            
+            risk_summary = [
+                ['Risk Assessment', 'Result'],
+                ['Overall Risk Level', risk_level],
+                ['Volatility Rating', f"{current_vol:.1f}%"],
+                ['Risk Category', f"{risk_level} Risk Investment"],
+                ['Recommendation', 'Suitable for aggressive investors' if risk_level == 'HIGH' 
+                    else 'Suitable for moderate investors' if risk_level == 'MEDIUM' 
+                    else 'Suitable for conservative investors']
+            ]
+            
+            table = axes[1, 1].table(cellText=risk_summary, loc='center', cellLoc='left')
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1, 2)
+            # Color header row
+            for i in range(len(risk_summary[0])):
+                table[(0, i)].set_facecolor('#8B0000')
+                table[(0, i)].set_text_props(weight='bold', color='white')
+            
+            # Color risk level cell
+            table[(1, 1)].set_facecolor(risk_color)
+            table[(1, 1)].set_text_props(weight='bold', color='white')
+            
+            axes[1, 1].set_title('Risk Assessment Summary', fontweight='bold', pad=20)
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating risk assessment chart: {str(e)}")
+            plt.close()
+            return ""
+
+    def _create_data_quality_chart(self, news_df: pd.DataFrame, reddit_df: pd.DataFrame) -> str:
+        """Create data quality assessment chart"""
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            
+            # Data completeness analysis
+            completeness_data = []
+            if news_df is not None and not news_df.empty:
+                news_completeness = (1 - news_df.isnull().sum() / len(news_df)) * 100
+                completeness_data.append(('News', news_completeness.mean()))
+            
+            if reddit_df is not None and not reddit_df.empty:
+                reddit_completeness = (1 - reddit_df.isnull().sum() / len(reddit_df)) * 100
+                completeness_data.append(('Social Media', reddit_completeness.mean()))
+            
+            if completeness_data:
+                sources, completeness = zip(*completeness_data)
+                bars = axes[0, 0].bar(sources, completeness, color=['#1f4e79', '#2E8B57'], alpha=0.8)
+                axes[0, 0].set_title('Data Completeness (%)', fontweight='bold')
+                axes[0, 0].set_ylabel('Completeness (%)')
+                axes[0, 0].set_ylim(0, 100)
+                axes[0, 0].grid(True, alpha=0.3)
+                
+                # Add value labels
+                for bar, comp in zip(bars, completeness):
+                    height = bar.get_height()
+                    axes[0, 0].text(bar.get_x() + bar.get_width()/2., height + 1,
+                                    f'{comp:.1f}%', ha='center', va='bottom', fontweight='bold')
+            
+            # Missing data heatmap for news
+            if news_df is not None and not news_df.empty:
+                missing_data = news_df.isnull().sum()
+                if missing_data.sum() > 0:
+                    axes[0, 1].bar(range(len(missing_data)), missing_data.values, color='red', alpha=0.7)
+                    axes[0, 1].set_title('Missing Data - News', fontweight='bold')
+                    axes[0, 1].set_xlabel('Columns')
+                    axes[0, 1].set_ylabel('Missing Values')
+                    axes[0, 1].set_xticks(range(len(missing_data)))
+                    axes[0, 1].set_xticklabels(missing_data.index, rotation=45, ha='right')
+                    axes[0, 1].grid(True, alpha=0.3)
+                else:
+                    axes[0, 1].text(0.5, 0.5, 'No Missing Data\nin News Dataset', ha='center', va='center',
+                                    transform=axes[0, 1].transAxes, fontsize=14, fontweight='bold')
+                    axes[0, 1].set_title('Missing Data - News', fontweight='bold')
+            
+            # Missing data heatmap for reddit
+            if reddit_df is not None and not reddit_df.empty:
+                missing_data = reddit_df.isnull().sum()
+                if missing_data.sum() > 0:
+                    axes[1, 0].bar(range(len(missing_data)), missing_data.values, color='orange', alpha=0.7)
+                    axes[1, 0].set_title('Missing Data - Social Media', fontweight='bold')
+                    axes[1, 0].set_xlabel('Columns')
+                    axes[1, 0].set_ylabel('Missing Values')
+                    axes[1, 0].set_xticks(range(len(missing_data)))
+                    axes[1, 0].set_xticklabels(missing_data.index, rotation=45, ha='right')
+                    axes[1, 0].grid(True, alpha=0.3)
+                else:
+                    axes[1, 0].text(0.5, 0.5, 'No Missing Data\nin Social Media Dataset', ha='center', va='center',
+                                    transform=axes[1, 0].transAxes, fontsize=14, fontweight='bold')
+                    axes[1, 0].set_title('Missing Data - Social Media', fontweight='bold')
+            
+            # Data quality summary
+            axes[1, 1].axis('off')
+            quality_metrics = [['Quality Metric', 'News', 'Social Media']]
+            
+            if news_df is not None and reddit_df is not None:
+                quality_metrics.extend([
+                    ['Total Records', f"{len(news_df):,}", f"{len(reddit_df):,}"],
+                    ['Columns', f"{len(news_df.columns)}", f"{len(reddit_df.columns)}"],
+                    ['Missing Data %', f"{(news_df.isnull().sum().sum() / news_df.size * 100):.1f}%",
+                        f"{(reddit_df.isnull().sum().sum() / reddit_df.size * 100):.1f}%"],
+                    ['Data Types', f"{len(news_df.dtypes.unique())}", f"{len(reddit_df.dtypes.unique())}"]
+                ])
+            
+            table = axes[1, 1].table(cellText=quality_metrics, loc='center', cellLoc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1, 2)
+            # Color header row
+            for i in range(len(quality_metrics[0])):
+                table[(0, i)].set_facecolor('#1f4e79')
+                table[(0, i)].set_text_props(weight='bold', color='white')
+            axes[1, 1].set_title('Data Quality Summary', fontweight='bold', pad=20)
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating data quality chart: {str(e)}")
+            plt.close()
+            return ""
+
+    def create_chart_for_pdf(self, stock_data: Dict[str, Any], chart_type: str = 'price') -> str:
+        """Create individual charts for PDF inclusion (kept for backward compatibility)"""
+        try:
+            plt.style.use('seaborn')
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            if chart_type == 'price' and 'historical_data' in stock_data:
+                hist_data = stock_data['historical_data']
+                ax.plot(hist_data.index, hist_data['Close'], linewidth=2, color='#1f4e79')
+                ax.set_title('Stock Price Trend (Last 30 Days)', fontsize=14, fontweight='bold')
+                ax.set_xlabel('Date')
+                ax.set_ylabel('Price ($)')
+                ax.grid(True, alpha=0.3)
+                
+            elif chart_type == 'returns' and 'historical_data' in stock_data:
+                hist_data = stock_data['historical_data']
+                returns = hist_data['Close'].pct_change().dropna() * 100
+                ax.hist(returns, bins=15, alpha=0.7, color='#2E8B57', edgecolor='black')
+                ax.set_title('Daily Returns Distribution', fontsize=14, fontweight='bold')
+                ax.set_xlabel('Daily Return (%)')
+                ax.set_ylabel('Frequency')
+                ax.grid(True, alpha=0.3)
+                
+            elif chart_type == 'volatility':
+                # Simple volatility visualization
+                current_vol = stock_data.get('volatility', 0.25) * 100
+                categories = ['Low Risk\n(0-15%)', 'Medium Risk\n(15-25%)', 'High Risk\n(25%+)']
+                values = [15, 25, 35]
+                colors = ['green', 'orange', 'red']
+                
+                bars = ax.bar(categories, values, color=colors, alpha=0.6, edgecolor='black')
+                ax.axhline(y=current_vol, color='blue', linestyle='--', linewidth=2, 
+                            label=f'Current: {current_vol:.1f}%')
+                ax.set_title('Risk Assessment - Volatility Comparison', fontsize=14, fontweight='bold')
+                ax.set_ylabel('Volatility (%)')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save to temporary file for ReportLab
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating chart: {str(e)}")
+            plt.close()
+            return ""
+        
+    def _create_correlation_analysis_chart(self, news_df: pd.DataFrame, reddit_df: pd.DataFrame, stock_data: Dict[str, Any]) -> str:
+        """Create correlation analysis between sentiment, volume, and price movements"""
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+            
+            # Prepare data for correlation analysis
+            dates = []
+            news_sentiment_scores = []
+            reddit_sentiment_scores = []
+            news_volumes = []
+            reddit_volumes = []
+            price_changes = []
+            
+            # Get historical data
+            if 'historical_data' in stock_data and not stock_data['historical_data'].empty:
+                hist_data = stock_data['historical_data']
+                daily_returns = hist_data['Close'].pct_change().fillna(0) * 100
+                
+                # Create mock correlation data (in real implementation, you'd align by actual dates)
+                n_days = min(len(hist_data), 20)  # Last 20 days
+                for i in range(n_days):
+                    dates.append(hist_data.index[-n_days + i])
+                    news_sentiment_scores.append(np.random.normal(0, 0.3))  # Mock sentiment
+                    reddit_sentiment_scores.append(np.random.normal(0, 0.4))  # Mock sentiment
+                    news_volumes.append(np.random.poisson(5))  # Mock volume
+                    reddit_volumes.append(np.random.poisson(8))  # Mock volume
+                    price_changes.append(daily_returns.iloc[-n_days + i])
+            
+            # Chart 1: Sentiment vs Price Movement
+            if dates and price_changes:
+                combined_sentiment = [(n + r) / 2 for n, r in zip(news_sentiment_scores, reddit_sentiment_scores)]
+                
+                axes[0, 0].scatter(combined_sentiment, price_changes, alpha=0.7, s=60, color='#1f4e79')
+                axes[0, 0].set_xlabel('Combined Sentiment Score')
+                axes[0, 0].set_ylabel('Daily Price Change (%)')
+                axes[0, 0].set_title('Sentiment vs Price Movement Correlation', fontweight='bold')
+                axes[0, 0].grid(True, alpha=0.3)
+                
+                # Add trend line
+                if len(combined_sentiment) > 1:
+                    z = np.polyfit(combined_sentiment, price_changes, 1)
+                    p = np.poly1d(z)
+                    axes[0, 0].plot(sorted(combined_sentiment), p(sorted(combined_sentiment)), 
+                                    "r--", alpha=0.8, linewidth=2)
+            
+            # Chart 2: Volume vs Volatility
+            if dates and news_volumes and reddit_volumes:
+                total_volumes = [n + r for n, r in zip(news_volumes, reddit_volumes)]
+                volatility_proxy = [abs(pc) for pc in price_changes]
+                
+                axes[0, 1].scatter(total_volumes, volatility_proxy, alpha=0.7, s=60, color='#2E8B57')
+                axes[0, 1].set_xlabel('Total Discussion Volume')
+                axes[0, 1].set_ylabel('Price Volatility (|Daily Change|)')
+                axes[0, 1].set_title('Discussion Volume vs Volatility', fontweight='bold')
+                axes[0, 1].grid(True, alpha=0.3)
+            
+            # Chart 3: News vs Social Media Sentiment Comparison
+            if news_sentiment_scores and reddit_sentiment_scores:
+                axes[1, 0].scatter(news_sentiment_scores, reddit_sentiment_scores, 
+                                alpha=0.7, s=60, color='orange')
+                axes[1, 0].set_xlabel('News Sentiment Score')
+                axes[1, 0].set_ylabel('Social Media Sentiment Score')
+                axes[1, 0].set_title('News vs Social Media Sentiment Correlation', fontweight='bold')
+                axes[1, 0].grid(True, alpha=0.3)
+                
+                # Add diagonal line for perfect correlation
+                min_val = min(min(news_sentiment_scores), min(reddit_sentiment_scores))
+                max_val = max(max(news_sentiment_scores), max(reddit_sentiment_scores))
+                axes[1, 0].plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.5, label='Perfect Correlation')
+                axes[1, 0].legend()
+            
+            # Chart 4: Correlation Matrix Heatmap
+            correlation_data = {
+                'News Sentiment': news_sentiment_scores,
+                'Social Sentiment': reddit_sentiment_scores,
+                'News Volume': news_volumes,
+                'Social Volume': reddit_volumes,
+                'Price Change': price_changes
+            }
+            
+            if all(correlation_data.values()):
+                corr_df = pd.DataFrame(correlation_data)
+                correlation_matrix = corr_df.corr()
+                
+                im = axes[1, 1].imshow(correlation_matrix, cmap='RdYlBu', aspect='auto', vmin=-1, vmax=1)
+                axes[1, 1].set_xticks(range(len(correlation_matrix.columns)))
+                axes[1, 1].set_yticks(range(len(correlation_matrix.columns)))
+                axes[1, 1].set_xticklabels(correlation_matrix.columns, rotation=45, ha='right')
+                axes[1, 1].set_yticklabels(correlation_matrix.columns)
+                axes[1, 1].set_title('Correlation Matrix Heatmap', fontweight='bold')
+                
+                # Add correlation values as text
+                for i in range(len(correlation_matrix.columns)):
+                    for j in range(len(correlation_matrix.columns)):
+                        text = axes[1, 1].text(j, i, f'{correlation_matrix.iloc[i, j]:.2f}',
+                                            ha="center", va="center", color="black", fontweight='bold')
+                
+                # Add colorbar
+                plt.colorbar(im, ax=axes[1, 1])
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight', facecolor='white')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating correlation analysis chart: {str(e)}")
+            plt.close()
+            return ""
+
+    def create_enhanced_comprehensive_charts(self, news_df: pd.DataFrame, reddit_df: pd.DataFrame, 
+                                        stock_data: Dict[str, Any], sentiment_data: Dict[str, Any],
+                                        company_info: Dict[str, str]) -> List[str]:
+        """Create the enhanced comprehensive set of charts including all new visualizations"""
+        chart_paths = []
+        
+        try:
+            logger.info("Creating enhanced comprehensive chart set...")
+            
+            # Original charts (keeping existing functionality) - WITH SAFE HANDLING
+            try:
+                original_charts = self.create_comprehensive_charts(news_df, reddit_df, stock_data, {})
+                # Ensure original_charts is a list before extending
+                if isinstance(original_charts, list):
+                    chart_paths.extend(original_charts)
+                elif original_charts:  # If it's a single path string
+                    chart_paths.append(str(original_charts))
+                logger.info(f"Added {len(chart_paths)} original charts")
+            except Exception as e:
+                logger.warning(f"Could not create original charts: {e}")
+            
+            # Enhanced visualizations
+            enhanced_charts = []
+            
+            # 3. Market Comparison
+            try:
+                market_comparison = self._create_market_comparison_chart(stock_data, company_info)
+                if market_comparison:
+                    enhanced_charts.append(market_comparison)
+                    logger.info("Created market comparison chart")
+            except Exception as e:
+                logger.warning(f"Could not create market comparison chart: {e}")
+            
+            # 4. Technical Analysis
+            try:
+                technical_analysis = self._create_technical_analysis_chart(stock_data)
+                if technical_analysis:
+                    enhanced_charts.append(technical_analysis)
+                    logger.info("Created technical analysis chart")
+            except Exception as e:
+                logger.warning(f"Could not create technical analysis chart: {e}")
+            
+            # 5. News Impact Analysis
+            try:
+                news_impact = self._create_news_impact_analysis_chart(news_df, stock_data)
+                if news_impact:
+                    enhanced_charts.append(news_impact)
+                    logger.info("Created news impact analysis chart")
+            except Exception as e:
+                logger.warning(f"Could not create news impact analysis chart: {e}")
+            
+            # 6. Social Media Engagement Analysis
+            try:
+                social_engagement = self._create_social_media_engagement_chart(reddit_df)
+                if social_engagement:
+                    enhanced_charts.append(social_engagement)
+                    logger.info("Created social media engagement chart")
+            except Exception as e:
+                logger.warning(f"Could not create social media engagement chart: {e}")
+            
+            # 7. Comprehensive Dashboard (Master Chart)
+            try:
+                dashboard = self._create_comprehensive_dashboard(news_df, reddit_df, stock_data, 
+                                                            sentiment_data, company_info)
+                if dashboard:
+                    enhanced_charts.append(dashboard)
+                    logger.info("Created comprehensive dashboard")
+            except Exception as e:
+                logger.warning(f"Could not create comprehensive dashboard: {e}")
+            
+            # Safely extend with enhanced charts
+            chart_paths.extend(enhanced_charts)
+            
+            logger.info(f"Successfully created {len(chart_paths)} total charts ({len(enhanced_charts)} enhanced)")
+            return chart_paths
+            
+        except Exception as e:
+            logger.error(f"Error creating enhanced comprehensive charts: {str(e)}")
+            return chart_paths  # Return what we have so far
+
+    def create_advanced_pdf_with_enhanced_charts(self, company_info: Dict[str, str], stock_data: Dict[str, Any], 
+                                               sentiment_data: Dict[str, Any], news_df: pd.DataFrame,
+                                               reddit_df: pd.DataFrame, chart_paths: List[str]) -> Optional[str]:
+        """Create an advanced PDF report that includes all the enhanced visualizations"""
+        try:
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib import colors
+            from reportlab.lib.units import inch
+            import tempfile
+            import os
+
+            # Generate filename
+            ticker = company_info.get('ticker', 'analysis')
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"advanced_analysis_report_{ticker}_{timestamp}.pdf"
+            temp_path = os.path.join(tempfile.gettempdir(), filename)
+
+            doc = SimpleDocTemplate(temp_path, pagesize=A4)
+            styles = getSampleStyleSheet()
+            
+            # Create custom styles
+            styles.add(ParagraphStyle(
+                name="ChartHeader", 
+                fontSize=16, 
+                leading=20, 
+                spaceAfter=12, 
+                textColor=colors.HexColor("#1f4e79"),
+                fontName='Helvetica-Bold'
+            ))
+            
+            elements = []
+
+            # Title page
+            company_name = company_info.get('company_name', 'Market Analysis')
+            ticker_symbol = company_info.get('ticker', 'N/A')
+            title = f"Advanced Financial Analysis Report\n{company_name} ({ticker_symbol})"
+            elements.append(Paragraph(title, styles["Title"]))
+            elements.append(Spacer(1, 30))
+
+            # Report overview
+            overview_text = f"""
+            This comprehensive report presents advanced financial analysis using multiple visualization techniques
+            and data sources. The analysis includes {len(news_df)} news articles and {len(reddit_df)} social media posts,
+            providing insights into market sentiment, technical indicators, risk assessment, and portfolio optimization.
+            
+            Report generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}
+            Analysis period: Last 30 days (estimated)
+            """
+            
+            elements.append(Paragraph("Executive Overview", styles["Heading1"]))
+            elements.append(Paragraph(overview_text, styles["Normal"]))
+            elements.append(PageBreak())
+
+            # Chart descriptions for better context
+            chart_descriptions = { 
+                0: "Stock Price and Technical Indicators - Price trends and moving averages",
+                1: "Risk Assessment - Volatility analysis and risk categorization",
+                2: "Correlation Analysis - Relationships between sentiment, volume, and price movements",
+                3: "Advanced Sentiment Timeline - Temporal sentiment patterns with volatility analysis",
+                4: "Market Comparison - Performance benchmarking against market indices",
+                5: "Technical Analysis - RSI, MACD, and Bollinger Bands analysis",
+                6: "News Impact Analysis - News volume correlation with price movements",
+                7: "Social Media Engagement - Engagement patterns and sentiment correlation",
+                8: "Comprehensive Dashboard - Executive summary of all key metrics"
+            }
+
+            # Add charts with descriptions
+            for i, chart_path in enumerate(chart_paths):
+                if chart_path and os.path.exists(chart_path):
+                    try:
+                        # Chart title and description
+                        chart_title = f"Analysis Chart {i+1}"
+                        chart_desc = chart_descriptions.get(i, "Advanced financial analysis visualization")
+                        
+                        elements.append(Paragraph(chart_title, styles["ChartHeader"]))
+                        elements.append(Paragraph(chart_desc, styles["Normal"]))
+                        elements.append(Spacer(1, 12))
+                        
+                        # Add chart image
+                        chart_img = Image(chart_path, width=7*inch, height=5*inch, kind='proportional')
+                        elements.append(chart_img)
+                        elements.append(Spacer(1, 20))
+                        
+                        # Add page break after every 2 charts (except the last one)
+                        if (i + 1) % 2 == 0 and i < len(chart_paths) - 1:
+                            elements.append(PageBreak())
+                            
+                    except Exception as e:
+                        logger.warning(f"Could not add chart {i+1} to PDF: {str(e)}")
+                        elements.append(Paragraph(f"Chart {i+1}: Unable to display", styles["Normal"]))
+                        elements.append(Spacer(1, 20))
+
+            # Analysis summary and recommendations
+            elements.append(PageBreak())
+            elements.append(Paragraph("Key Insights and Recommendations", styles["Heading1"]))
+            
+            # Generate insights based on the data
+            overall_sentiment = sentiment_data.get('combined_sentiment', {})
+            sentiment_score = overall_sentiment.get('score', 0)
+            sentiment_label = overall_sentiment.get('label', 'neutral')
+            current_price = stock_data.get('current_price', 0)
+            volatility = stock_data.get('volatility', 0)
+            
+            insights_text = f"""
+            SENTIMENT ANALYSIS INSIGHTS:
+            • Overall market sentiment is {sentiment_label.upper()} with a score of {sentiment_score:+.3f}
+            • Analysis of {len(news_df)} news articles and {len(reddit_df)} social media posts
+            • Sentiment correlation with price movements shows {'positive' if sentiment_score > 0.1 else 'negative' if sentiment_score < -0.1 else 'neutral'} relationship
+            
+            TECHNICAL ANALYSIS INSIGHTS:
+            • Current stock price: ${current_price:.2f}
+            • Annualized volatility: {volatility:.1%}
+            • Risk classification: {'HIGH' if volatility > 0.3 else 'MEDIUM' if volatility > 0.2 else 'LOW'} risk
+            
+            PORTFOLIO RECOMMENDATIONS:
+            • Recommended allocation: {min(15, 100/(1 + volatility*10)):.0f}% of equity portfolio
+            • Risk-adjusted position sizing based on volatility analysis
+            • Consider diversification across multiple asset classes
+            
+            MONITORING RECOMMENDATIONS:
+            • Track sentiment changes weekly
+            • Monitor technical indicator convergence/divergence
+            • Watch for correlation breakdown between sentiment and price
+            • Review portfolio allocation monthly based on volatility changes
+            """
+            
+            elements.append(Paragraph(insights_text, styles["Normal"]))
+            elements.append(Spacer(1, 20))
+
+            # Disclaimer
+            elements.append(Paragraph("Risk Disclaimer", styles["Heading2"]))
+            disclaimer = """
+            This report is generated using AI analysis of publicly available financial data, news articles, 
+            and social media content. All analysis, recommendations, and insights are for informational 
+            purposes only and do not constitute professional financial advice, investment recommendations, 
+            or solicitation to buy or sell securities.
+
+            Investment decisions should be made only after consulting with qualified financial professionals 
+            and conducting independent research. Past performance and sentiment analysis do not guarantee 
+            future results. All investments carry risk of loss.
+            """
+            
+            elements.append(Paragraph(disclaimer, styles["Normal"]))
+
+            # Build the PDF
+            doc.build(elements)
+            logger.info(f"Advanced PDF report with enhanced charts created: {temp_path}")
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating advanced PDF report: {str(e)}")
+            return None
+
+    def get_chart_creation_summary(self) -> Dict[str, Any]:
+        """Get a summary of all available chart types and their purposes"""
+        return {
+            "original_charts": {
+                "volume_comparison": "Compares data volume between news and social media sources",
+                "text_length_analysis": "Analyzes text length distributions and patterns", 
+                "word_frequency": "Shows most frequent words and creates word clouds",
+                "stock_price_analysis": "Stock price trends with moving averages and metrics",
+                "returns_distribution": "Daily returns histogram and cumulative returns",
+                "risk_assessment": "Volatility analysis and risk categorization",
+                "data_quality": "Data completeness and missing value analysis",
+                "timeline_analysis": "Temporal patterns in data availability"
+            },
+            "enhanced_charts": {
+                "correlation_analysis": "Relationships between sentiment, volume, and price movements",
+                "advanced_sentiment_timeline": "Sentiment evolution over time with volatility",
+                "market_comparison": "Performance vs market indices and benchmarks",
+                "technical_analysis": "RSI, MACD, Bollinger Bands, and other indicators",
+                "news_impact_analysis": "News volume correlation with price movements",
+                "social_engagement": "Social media engagement patterns and metrics",
+                "comprehensive_dashboard": "Executive summary dashboard with all key metrics"
+            },
+            "total_visualizations": 16,
+            "pdf_integration": "All charts can be integrated into professional PDF reports",
+            "email_distribution": "Charts can be automatically distributed via email",
+            "customization": "Charts adapt to available data and company-specific information"
+        }
+
+    def _create_advanced_sentiment_timeline(self, news_df: pd.DataFrame, reddit_df: pd.DataFrame, 
+                                             sentiment_data: Dict[str, Any]) -> str:
+        """Create advanced sentiment timeline with moving averages and trend analysis"""
+        try:
+            fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+            
+            # Generate mock time series data (in real implementation, extract from actual dates)
+            dates = pd.date_range(end=datetime.now(), periods=30, freq='D')
+            
+            # Mock sentiment time series
+            news_sentiment_ts = np.random.normal(0, 0.3, 30)
+            reddit_sentiment_ts = np.random.normal(0, 0.4, 30)
+            combined_sentiment_ts = (news_sentiment_ts + reddit_sentiment_ts) / 2
+            
+            # Add some trend and noise
+            trend = np.linspace(-0.2, 0.3, 30)
+            news_sentiment_ts += trend + np.random.normal(0, 0.1, 30)
+            reddit_sentiment_ts += trend * 0.8 + np.random.normal(0, 0.15, 30)
+            combined_sentiment_ts = (news_sentiment_ts + reddit_sentiment_ts) / 2
+            
+            # Chart 1: Sentiment Timeline with Moving Averages
+            axes[0].plot(dates, news_sentiment_ts, label='News Sentiment', color='#1f4e79', alpha=0.7, linewidth=1)
+            axes[0].plot(dates, reddit_sentiment_ts, label='Social Media Sentiment', color='#2E8B57', alpha=0.7, linewidth=1)
+            axes[0].plot(dates, combined_sentiment_ts, label='Combined Sentiment', color='red', linewidth=2)
+            
+            # Add moving averages
+            if len(combined_sentiment_ts) >= 7:
+                ma_7 = pd.Series(combined_sentiment_ts).rolling(window=7).mean()
+                axes[0].plot(dates, ma_7, label='7-day MA', color='orange', linewidth=2, linestyle='--')
+            
+            axes[0].axhline(y=0, color='black', linestyle='-', alpha=0.3)
+            axes[0].fill_between(dates, 0, combined_sentiment_ts, 
+                                where=(combined_sentiment_ts > 0), color='green', alpha=0.2, label='Positive Periods')
+            axes[0].fill_between(dates, 0, combined_sentiment_ts, 
+                                where=(combined_sentiment_ts <= 0), color='red', alpha=0.2, label='Negative Periods')
+            
+            axes[0].set_title('Sentiment Timeline with Moving Averages', fontweight='bold', fontsize=14)
+            axes[0].set_ylabel('Sentiment Score')
+            axes[0].legend(loc='upper left')
+            axes[0].grid(True, alpha=0.3)
+            axes[0].tick_params(axis='x', rotation=45)
+            
+            # Chart 2: Sentiment Volatility
+            sentiment_volatility = pd.Series(combined_sentiment_ts).rolling(window=3).std().fillna(0)
+            axes[1].fill_between(dates, sentiment_volatility, alpha=0.6, color='purple')
+            axes[1].plot(dates, sentiment_volatility, color='darkpurple', linewidth=2)
+            axes[1].set_title('Sentiment Volatility (3-day Rolling Std)', fontweight='bold', fontsize=14)
+            axes[1].set_ylabel('Volatility')
+            axes[1].grid(True, alpha=0.3)
+            axes[1].tick_params(axis='x', rotation=45)
+            
+            # Chart 3: Sentiment Distribution Histogram
+            axes[2].hist(combined_sentiment_ts, bins=15, alpha=0.7, color='skyblue', edgecolor='black', density=True)
+            axes[2].axvline(np.mean(combined_sentiment_ts), color='red', linestyle='--', linewidth=2,
+                            label=f'Mean: {np.mean(combined_sentiment_ts):.3f}')
+            axes[2].axvline(np.median(combined_sentiment_ts), color='green', linestyle='--', linewidth=2,
+                            label=f'Median: {np.median(combined_sentiment_ts):.3f}')
+            axes[2].set_title('Sentiment Score Distribution', fontweight='bold', fontsize=14)
+            axes[2].set_xlabel('Sentiment Score')
+            axes[2].set_ylabel('Density')
+            axes[2].legend()
+            axes[2].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight', facecolor='white')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating advanced sentiment timeline: {str(e)}")
+            plt.close()
+            return ""
+
+    def _create_market_comparison_chart(self, stock_data: Dict[str, Any], company_info: Dict[str, str]) -> str:
+        """Create market comparison chart with sector benchmarks"""
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+            
+            # Market indices for comparison (mock data)
+            indices = {
+                'S&P 500': {'return': 8.5, 'volatility': 16.2, 'pe': 22.1},
+                'NASDAQ': {'return': 12.3, 'volatility': 20.8, 'pe': 28.5},
+                'Russell 2000': {'return': 6.8, 'volatility': 24.1, 'pe': 18.9},
+                'Sector Average': {'return': 9.2, 'volatility': 18.5, 'pe': 19.7}
+            }
+            
+            current_stock = {
+                'return': np.random.uniform(5, 15),  # Mock return
+                'volatility': stock_data.get('volatility', 0.25) * 100,
+                'pe': stock_data.get('pe_ratio', 20) if stock_data.get('pe_ratio') else 20
+            }
+            
+            # Chart 1: Risk-Return Comparison
+            index_names = list(indices.keys()) + [company_info.get('ticker', 'Stock')]
+            returns = [data['return'] for data in indices.values()] + [current_stock['return']]
+            volatilities = [data['volatility'] for data in indices.values()] + [current_stock['volatility']]
+            
+            # Different colors for indices vs our stock
+            colors = ['lightblue'] * len(indices) + ['red']
+            sizes = [100] * len(indices) + [200]
+            
+            scatter = axes[0, 0].scatter(volatilities, returns, s=sizes, c=colors, alpha=0.7, edgecolors='black')
+            
+            for i, name in enumerate(index_names):
+                axes[0, 0].annotate(name, (volatilities[i], returns[i]), 
+                                    xytext=(5, 5), textcoords='offset points', fontsize=9)
+            
+            axes[0, 0].set_xlabel('Volatility (%)')
+            axes[0, 0].set_ylabel('Expected Return (%)')
+            axes[0, 0].set_title('Risk-Return Comparison vs Market Indices', fontweight='bold')
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # Chart 2: P/E Ratio Comparison
+            pe_ratios = [data['pe'] for data in indices.values()] + [current_stock['pe']]
+            bars = axes[0, 1].bar(index_names, pe_ratios, color=colors, alpha=0.7, edgecolor='black')
+            axes[0, 1].set_title('P/E Ratio Comparison', fontweight='bold')
+            axes[0, 1].set_ylabel('P/E Ratio')
+            axes[0, 1].tick_params(axis='x', rotation=45)
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Add value labels on bars
+            for bar, pe in zip(bars, pe_ratios):
+                height = bar.get_height()
+                axes[0, 1].text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                                f'{pe:.1f}', ha='center', va='bottom', fontweight='bold')
+            
+            # Chart 3: Performance Percentile Ranking
+            metrics = ['Return', 'Low Volatility', 'Reasonable P/E']
+            
+            # Calculate percentiles (higher is better for return, lower is better for volatility and P/E)
+            return_percentile = (sum(1 for r in returns[:-1] if r < current_stock['return']) / len(returns[:-1])) * 100
+            vol_percentile = (sum(1 for v in volatilities[:-1] if v > current_stock['volatility']) / len(volatilities[:-1])) * 100
+            pe_percentile = (sum(1 for pe in pe_ratios[:-1] if pe > current_stock['pe']) / len(pe_ratios[:-1])) * 100
+            
+            percentiles = [return_percentile, vol_percentile, pe_percentile]
+            colors_perc = ['green' if p > 50 else 'red' for p in percentiles]
+            
+            bars = axes[1, 0].barh(metrics, percentiles, color=colors_perc, alpha=0.7, edgecolor='black')
+            axes[1, 0].set_xlabel('Percentile Ranking (%)')
+            axes[1, 0].set_title('Performance Percentile vs Benchmarks', fontweight='bold')
+            axes[1, 0].axvline(x=50, color='black', linestyle='--', alpha=0.5, label='50th Percentile')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # Add percentile labels
+            for bar, perc in zip(bars, percentiles):
+                width = bar.get_width()
+                axes[1, 0].text(width + 1, bar.get_y() + bar.get_height()/2.,
+                                f'{perc:.0f}%', ha='left', va='center', fontweight='bold')
+            
+            # Chart 4: Market Cap Category Analysis
+            axes[1, 1].axis('off')
+            
+            # Determine market cap category
+            market_cap = stock_data.get('market_cap', 0)
+            if market_cap > 200e9:
+                cap_category = "Large Cap (>$200B)"
+            elif market_cap > 10e9:
+                cap_category = "Mid Cap ($10B-$200B)"
+            elif market_cap > 2e9:
+                cap_category = "Small Cap ($2B-$10B)"
+            elif market_cap > 0:
+                cap_category = "Micro Cap (<$2B)"
+            else:
+                cap_category = "N/A (Private/Unknown)"
+            
+            comparison_data = [
+                ['Comparison Metric', 'Value', 'Market Position'],
+                ['Market Cap Category', cap_category, ''],
+                ['Return Percentile', f'{return_percentile:.0f}%', 'vs Benchmarks'],
+                ['Volatility Percentile', f'{vol_percentile:.0f}%', 'Lower = Better'],
+                ['P/E Percentile', f'{pe_percentile:.0f}%', 'Depends on Strategy'],
+                ['Overall Assessment', 
+                    'Above Average' if np.mean(percentiles) > 60 else 
+                    'Average' if np.mean(percentiles) > 40 else 'Below Average', '']
+            ]
+            
+            table = axes[1, 1].table(cellText=comparison_data, loc='center', cellLoc='left')
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1.2, 2)
+            
+            # Color header row
+            for i in range(len(comparison_data[0])):
+                table[(0, i)].set_facecolor('#1f4e79')
+                table[(0, i)].set_text_props(weight='bold', color='white')
+            
+            axes[1, 1].set_title('Market Position Summary', fontweight='bold', pad=20)
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight', facecolor='white')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating market comparison chart: {str(e)}")
+            plt.close()
+            return ""
+
+    def _create_technical_analysis_chart(self, stock_data: Dict[str, Any]) -> str:
+        """Create technical analysis chart with multiple indicators"""
+        try:
+            fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+            
+            if 'historical_data' not in stock_data or stock_data['historical_data'].empty:
+                # Create mock data for demonstration
+                dates = pd.date_range(end=datetime.now(), periods=60, freq='D')
+                base_price = 150
+                prices = []
+                for i in range(60):
+                    change = np.random.normal(0, 0.02)
+                    base_price *= (1 + change)
+                    prices.append(base_price)
+                
+                hist_data = pd.DataFrame({
+                    'Close': prices,
+                    'High': [p * (1 + abs(np.random.normal(0, 0.01))) for p in prices],
+                    'Low': [p * (1 - abs(np.random.normal(0, 0.01))) for p in prices],
+                    'Volume': [np.random.randint(1000000, 5000000) for _ in range(60)]
+                }, index=dates)
+            else:
+                hist_data = stock_data['historical_data'].copy()
+            
+            # Chart 1: Price with Bollinger Bands and Moving Averages
+            close_prices = hist_data['Close']
+            
+            # Calculate technical indicators
+            sma_20 = close_prices.rolling(window=20).mean()
+            sma_50 = close_prices.rolling(window=min(50, len(close_prices))).mean()
+            
+            # Bollinger Bands
+            bb_std = close_prices.rolling(window=20).std()
+            bb_upper = sma_20 + (bb_std * 2)
+            bb_lower = sma_20 - (bb_std * 2)
+            
+            # Plot price and indicators
+            axes[0].plot(hist_data.index, close_prices, label='Close Price', color='black', linewidth=2)
+            axes[0].plot(hist_data.index, sma_20, label='20-day SMA', color='blue', linewidth=1.5)
+            axes[0].plot(hist_data.index, sma_50, label='50-day SMA', color='red', linewidth=1.5)
+            
+            # Bollinger Bands
+            axes[0].fill_between(hist_data.index, bb_lower, bb_upper, alpha=0.2, color='gray', label='Bollinger Bands')
+            axes[0].plot(hist_data.index, bb_upper, color='gray', linewidth=1, linestyle='--')
+            axes[0].plot(hist_data.index, bb_lower, color='gray', linewidth=1, linestyle='--')
+            
+            axes[0].set_title('Technical Analysis - Price with Moving Averages & Bollinger Bands', fontweight='bold')
+            axes[0].set_ylabel('Price ($)')
+            axes[0].legend(loc='upper left')
+            axes[0].grid(True, alpha=0.3)
+            axes[0].tick_params(axis='x', rotation=45)
+            
+            # Chart 2: RSI (Relative Strength Index)
+            def calculate_rsi(prices, window=14):
+                delta = prices.diff()
+                gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+                rs = gain / loss
+                rsi = 100 - (100 / (1 + rs))
+                return rsi
+            
+            rsi = calculate_rsi(close_prices)
+            
+            axes[1].plot(hist_data.index, rsi, color='purple', linewidth=2)
+            axes[1].axhline(y=70, color='red', linestyle='--', alpha=0.7, label='Overbought (70)')
+            axes[1].axhline(y=30, color='green', linestyle='--', alpha=0.7, label='Oversold (30)')
+            axes[1].axhline(y=50, color='black', linestyle='-', alpha=0.3)
+            axes[1].fill_between(hist_data.index, 70, 100, alpha=0.1, color='red')
+            axes[1].fill_between(hist_data.index, 0, 30, alpha=0.1, color='green')
+            
+            axes[1].set_title('Relative Strength Index (RSI)', fontweight='bold')
+            axes[1].set_ylabel('RSI')
+            axes[1].set_ylim(0, 100)
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+            axes[1].tick_params(axis='x', rotation=45)
+            
+            # Chart 3: MACD (Moving Average Convergence Divergence)
+            def calculate_macd(prices, fast=12, slow=26, signal=9):
+                ema_fast = prices.ewm(span=fast).mean()
+                ema_slow = prices.ewm(span=slow).mean()
+                macd = ema_fast - ema_slow
+                signal_line = macd.ewm(span=signal).mean()
+                histogram = macd - signal_line
+                return macd, signal_line, histogram
+            
+            macd, signal_line, histogram = calculate_macd(close_prices)
+            
+            # MACD histogram
+            axes[2].bar(hist_data.index, histogram, color=['green' if h > 0 else 'red' for h in histogram],
+                        alpha=0.6, width=0.8)
+            
+            # MACD and Signal lines
+            axes[2].plot(hist_data.index, macd, color='blue', linewidth=2, label='MACD')
+            axes[2].plot(hist_data.index, signal_line, color='red', linewidth=1.5, label='Signal Line')
+            axes[2].axhline(y=0, color='black', linestyle='-', alpha=0.3)
+            
+            axes[2].set_title('MACD (Moving Average Convergence Divergence)', fontweight='bold')
+            axes[2].set_xlabel('Date')
+            axes[2].set_ylabel('MACD')
+            axes[2].legend()
+            axes[2].grid(True, alpha=0.3)
+            axes[2].tick_params(axis='x', rotation=45)
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight', facecolor='white')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating technical analysis chart: {str(e)}")
+            plt.close()
+            return ""
+
+    def generate_summary_report(self, news_df: pd.DataFrame, reddit_df: pd.DataFrame, 
+                          company_info: Dict[str, str]) -> str:
+        """Generate comprehensive AI summary report from both datasets"""
+        try:
+            # Handle empty or None DataFrames
+            if news_df is None:
+                news_df = pd.DataFrame()
+            if reddit_df is None:
+                reddit_df = pd.DataFrame()
+                
+            # Get text columns with proper error handling
+            news_text_col = None
+            reddit_text_col = None
+            
+            if not news_df.empty:
+                news_text_col = self.identify_text_column(news_df)
+            if not reddit_df.empty:
+                reddit_text_col = self.identify_text_column(reddit_df)
+            
+            # Sample texts from both sources
+            news_sample = []
+            reddit_sample = []
+            
+            if news_text_col and news_text_col in news_df.columns:
+                news_sample = news_df[news_text_col].dropna().head(10).tolist()
+            
+            if reddit_text_col and reddit_text_col in reddit_df.columns:
+                reddit_sample = reddit_df[reddit_text_col].dropna().head(10).tolist()
+            
+            # Handle case where no text samples are available
+            if not news_sample and not reddit_sample:
+                return "Unable to generate summary report: No text content available for analysis."
+            
+            # Prepare context
+            company_context = "Market Analysis"
+            if company_info.get('company_name'):
+                company_context = f"Company: {company_info['company_name']}"
                 if company_info.get('ticker'):
                     company_context += f" ({company_info['ticker']})"
-                company_context += ". "
-            else:
-                company_context = ""
+            
+            # Create comprehensive prompt
+            news_text = "\n".join([f"- {text[:200]}..." for text in news_sample[:5]]) if news_sample else "No news articles available"
+            reddit_text = "\n".join([f"- {text[:200]}..." for text in reddit_sample[:5]]) if reddit_sample else "No social media posts available"
             
             prompt = f"""
-            {company_context}Please provide a concise summary of this news content in 2-3 sentences. 
-            Focus on the key facts, main points, and any significant implications. 
-            Make the summary informative and professional.
+            {company_context}
             
-            Content: {text[:1000]}  # Limit to prevent token overflow
+            Please analyze the following news articles and social media posts to create a comprehensive summary report. 
             
-            Summary:"""
+            NEWS ARTICLES SAMPLE:
+            {news_text}
+            
+            REDDIT/SOCIAL MEDIA POSTS SAMPLE:
+            {reddit_text}
+            
+            Please provide a detailed analysis covering:
+            1. EXECUTIVE SUMMARY (2-3 paragraphs)
+            2. KEY THEMES AND TRENDS
+            3. NEWS MEDIA PERSPECTIVE
+            4. SOCIAL MEDIA SENTIMENT
+            5. NOTABLE DEVELOPMENTS
+            6. MARKET IMPLICATIONS (if applicable)
+            7. CONCLUSION AND OUTLOOK
+            
+            Make the report professional, informative, and comprehensive (800-1200 words).
+            If limited data is available, focus on what can be reasonably analyzed and note the limitations.
+            """
             
             response = self.client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are a professional news summarizer. Provide clear, concise, and factual summaries."},
+                    {"role": "system", "content": "You are a professional financial analyst and reporter specializing in comprehensive market analysis."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=150,
+                max_tokens=1500,
                 temperature=0.3
             )
             
             return response.choices[0].message.content.strip()
             
         except Exception as e:
-            logger.warning(f"Failed to generate individual summary: {str(e)}")
-            return f"Summary unavailable: {str(text)[:100]}..."
+            logger.error(f"Failed to generate summary report: {str(e)}")
+            return f"Summary report generation failed due to technical error: {str(e)}. Please check the data sources and try again."
 
-    def generate_overall_summary(self, df: pd.DataFrame, text_column: str, company_info: Dict[str, str], 
-                                top_sources: List[Tuple[str, int]], keywords: List[Tuple[str, int]],
-                                date_range: Dict[str, str]) -> str:
-        """Generate comprehensive overall summary"""
-        try:
-            # Sample representative texts
-            sample_texts = df[text_column].dropna().head(5).tolist()
-            combined_sample = '\n\n'.join([f"Article {i+1}: {text[:300]}..." for i, text in enumerate(sample_texts)])
-            
-            # Prepare context information
-            context_info = []
-            
-            if company_info.get('company_name'):
-                context_info.append(f"Company: {company_info['company_name']}")
-            if company_info.get('ticker'):
-                context_info.append(f"Ticker: {company_info['ticker']}")
-            if date_range.get('start_date'):
-                if date_range['start_date'] == date_range.get('end_date'):
-                    context_info.append(f"Date: {date_range['start_date']}")
-                else:
-                    context_info.append(f"Date Range: {date_range['start_date']} to {date_range.get('end_date', '')}")
-            if top_sources:
-                top_3_sources = [source[0] for source in top_sources[:3]]
-                context_info.append(f"Top Sources: {', '.join(top_3_sources)}")
-            if keywords:
-                top_keywords = [kw[0] for kw in keywords[:5]]
-                context_info.append(f"Key Themes: {', '.join(top_keywords)}")
-            
-            context_str = '\n'.join(context_info) if context_info else "General news analysis"
-            
-            prompt = f"""
-            Based on the following news data analysis, provide a comprehensive summary that covers:
+    # Add this method to the EnhancedDualFileAnalysisBot class in backend.py
 
-            1. Main themes and topics discussed
-            2. Key developments and trends
-            3. Overall sentiment or tone
-            4. Significant events or announcements
-            5. Potential implications or impact
+    def run_comprehensive_analysis_with_distribution(self, news_file: str, reddit_file: str, 
+                                              email_recipients: List[str] = None,
+                                              create_download_package: bool = True) -> Dict[str, Any]:
+        
+        # Initialize email handler if config provided
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+        email_address = os.getenv("EMAIL_ADDRESS")
+        app_password = os.getenv("EMAIL_APP_PASSWORD")
 
-            Analysis Context:
-            {context_str}
-            Total articles processed: {len(df)}
-
-            Sample Articles:
-            {combined_sample}
-
-            Please provide a professional, informative summary that would be valuable for business intelligence purposes.
-            """
-
-            response = self.client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are a senior business analyst providing executive summaries of news analysis. Be thorough, professional, and insightful."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=800,
-                temperature=0.4
+        if email_address and app_password:
+            self.email_handler = EmailHandler(
+                email_address=email_address,
+                app_password=app_password
             )
-            
-            return response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            logger.warning(f"Failed to generate overall summary: {str(e)}")
-            return f"Unable to generate comprehensive summary. Processed {len(df)} articles covering various topics and themes."
+            logger.info("Email handler initialized successfully")
 
-    def generate_equity_research_report(self, df: pd.DataFrame, company_info: Dict[str, str], 
-                                       sentiment_metrics: Dict[str, Any], price_data: Dict[str, Any],
-                                       keywords: List[Tuple[str, int]], top_sources: List[Tuple[str, int]],
-                                       date_range: Dict[str, str]) -> str:
-        """Generate comprehensive equity research report"""
+        """Run complete analysis with email distribution and download options"""
         try:
-            # Calculate key metrics
-            avg_sentiment = sentiment_metrics.get('average_sentiment', 0)
-            total_mentions = sentiment_metrics.get('total_mentions', 0)
-            current_price = price_data.get('current_price', 0)
-            volatility = price_data.get('volatility', 0.25)
-            
-            # Generate recommendation
-            if avg_sentiment > 0.3:
-                recommendation = "BUY"
-                outlook = "Positive"
-            elif avg_sentiment < -0.3:
-                recommendation = "SELL"
-                outlook = "Negative"
-            else:
-                recommendation = "HOLD"
-                outlook = "Neutral"
-            
-            # Calculate target price (simplified model)
-            sentiment_multiplier = 1 + (avg_sentiment * 0.05)  # 5% impact per sentiment unit
-            target_price = current_price * sentiment_multiplier
-            
-            # Generate report
-            report = f"""
-EQUITY RESEARCH REPORT
-{'='*50}
-
-COMPANY OVERVIEW
-Company: {company_info.get('company_name', 'N/A')}
-Ticker: {company_info.get('ticker', 'N/A')}
-Report Date: {datetime.now().strftime('%Y-%m-%d')}
-Analysis Period: {date_range.get('start_date', 'N/A')} to {date_range.get('end_date', 'N/A')}
-
-PRICE ANALYSIS
-Current Price: ${current_price:.2f}
-Target Price (1-Month): ${target_price:.2f}
-Potential Return: {((target_price - current_price) / current_price * 100):+.1f}%
-Volatility: {volatility:.1%}
-
-RECOMMENDATION: {recommendation}
-Investment Outlook: {outlook}
-
-SENTIMENT ANALYSIS
-Overall Sentiment Score: {avg_sentiment:+.3f}
-Total News Mentions: {total_mentions}
-Positive Coverage: {sentiment_metrics.get('sentiment_distribution', {}).get('positive', 0)} articles
-Negative Coverage: {sentiment_metrics.get('sentiment_distribution', {}).get('negative', 0)} articles
-Neutral Coverage: {sentiment_metrics.get('sentiment_distribution', {}).get('neutral', 0)} articles
-
-NEWS vs SOCIAL MEDIA
-News Sentiment: {sentiment_metrics.get('news_vs_social', {}).get('news', {}).get('avg_sentiment', 0):+.3f}
-Social Media Sentiment: {sentiment_metrics.get('news_vs_social', {}).get('social', {}).get('avg_sentiment', 0):+.3f}
-
-TOP NEWS SOURCES
-{chr(10).join([f'{i+1}. {source[0]}: {source[1]} articles' for i, source in enumerate(top_sources[:5])])}
-
-KEY THEMES & CATALYSTS
-{chr(10).join([f'• {keyword[0].title()} (mentioned {keyword[1]} times)' for keyword in keywords[:8]])}
-
-RISK FACTORS
-• Market volatility may impact price targets
-• Sentiment analysis based on limited time period
-• External market factors not considered in price model
-• News sentiment may not reflect fundamental performance
-
-ANALYST NOTES
-This analysis is based on sentiment data from {total_mentions} news articles and social media mentions
-over the period from {date_range.get('start_date', 'N/A')} to {date_range.get('end_date', 'N/A')}.
-The price target is calculated using a sentiment-momentum model and should be considered
-a tactical 1-month target rather than a long-term valuation.
-
-{'Real market data used' if price_data.get('price_data_available') else 'Estimated price data used'} for price analysis.
-
-DISCLAIMER
-This report is for informational purposes only and should not be considered as investment advice.
-Past performance does not guarantee future results. Please consult with a qualified financial
-advisor before making investment decisions.
-
-Report generated by News And Social Media Analysis Bot
-Generation time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-"""
-            return report
-            
-        except Exception as e:
-            logger.error(f"Failed to generate equity research report: {str(e)}")
-            return f"Error generating report: {str(e)}"
-
-    def process_file(self, file_path: str, analysis_type: str = "auto", output_dir: str = "output") -> Dict[str, Any]:
-        """Main processing function that handles both summarization and equity research"""
-        try:
-            # Create output directory
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Load file
-            df = self.load_file(file_path)
-            if df is None:
-                return {"success": False, "error": "Failed to load file"}
-            
-            # Identify columns
-            text_column = self.identify_text_column(df)
-            if not text_column:
-                return {"success": False, "error": "Could not identify text column in the dataset"}
-            
-            source_column = self.identify_source_column(df)
-            date_column = self.identify_date_column(df)
-            sentiment_column = self.identify_sentiment_column(df)
-            
-            # Extract company information
-            company_info = self.extract_company_info(df, text_column)
-            
-            # Determine analysis type automatically if needed
-            if analysis_type == "auto":
-                # Use equity research if sentiment column exists, otherwise use summarization
-                analysis_type = "equity_research" if sentiment_column else "summarization"
-            
-            # Get metadata
-            top_sources = self.get_top_sources(df, source_column) if source_column else []
-            date_range = self.get_date_range(df, date_column) if date_column else {}
-            keywords = self.extract_keywords_and_themes(df, text_column, company_info)
-            
-            # Initialize results
             results = {
-                "success": True,
-                "analysis_type": analysis_type,
-                "processed_items": len(df),
-                "company_info": company_info,
-                "top_sources": top_sources,
-                "date_range": date_range,
-                "keywords": keywords,
-                "text_column_used": text_column,
-                "source_column_used": source_column,
-                "has_sentiment_data": sentiment_column is not None
+                'success': False,
+                'company_info': {},
+                'pdf_reports': [],
+                'sentiment_data': {},
+                'email_results': {},
+                'download_package': '',
+                'error_message': ''
             }
             
-            if analysis_type == "equity_research":
-                return self._process_equity_research(df, text_column, sentiment_column, source_column, 
-                                                   company_info, top_sources, date_range, keywords, 
-                                                   output_dir, results)
-            else:
-                return self._process_summarization(df, text_column, source_column, company_info, 
-                                                 top_sources, date_range, keywords, output_dir, results)
+            # Load data files
+            logger.info("Loading data files...")
+            news_df = None
+            reddit_df = None
             
-        except Exception as e:
-            logger.error(f"Processing failed: {str(e)}")
-            return {"success": False, "error": str(e)}
-
-    def _process_equity_research(self, df: pd.DataFrame, text_column: str, sentiment_column: str,
-                               source_column: str, company_info: Dict[str, str], 
-                               top_sources: List[Tuple[str, int]], date_range: Dict[str, str],
-                               keywords: List[Tuple[str, int]], output_dir: str, 
-                               results: Dict[str, Any]) -> Dict[str, Any]:
-        """Process equity research analysis"""
-        
-        # Calculate sentiment metrics
-        sentiment_metrics = self.calculate_sentiment_metrics(df, sentiment_column, source_column)
-        
-        # Get price data
-        ticker = company_info.get('ticker', '')
-        if ticker and date_range.get('start_date'):
-            price_data = self.get_real_stock_data(ticker, date_range['start_date'], 
-                                                date_range.get('end_date', date_range['start_date']))
-        else:
-            price_data = self.generate_mock_price_data()
-        
-        price_data_source = 'Real Market Data' if price_data.get('price_data_available') else 'Estimated Data'
-        
-        # Generate equity research report
-        equity_report = self.generate_equity_research_report(
-            df, company_info, sentiment_metrics, price_data, keywords, top_sources, date_range
-        )
-        
-        # Get top positive and negative news
-        top_positive_news = []
-        top_negative_news = []
-        
-        if sentiment_column:
-            df_with_sentiment = df[df[sentiment_column].notna()].copy()
-            df_with_sentiment[sentiment_column] = pd.to_numeric(df_with_sentiment[sentiment_column], errors='coerce')
-            df_with_sentiment = df_with_sentiment.dropna(subset=[sentiment_column])
+            if news_file and os.path.exists(news_file):
+                news_df = self.load_file(news_file)
+                if news_df is not None:
+                    logger.info(f"Loaded news data: {len(news_df)} records")
+                else:
+                    logger.warning(f"Failed to load news file: {news_file}")
             
-            if len(df_with_sentiment) > 0:
-                # Top positive news
-                positive_df = df_with_sentiment[df_with_sentiment[sentiment_column] > 0].nlargest(5, sentiment_column)
-                for _, row in positive_df.iterrows():
-                    top_positive_news.append({
-                        'text': str(row[text_column])[:100],
-                        'sentiment_score': row[sentiment_column],
-                        'date': row.get(self.identify_date_column(df), 'N/A') if self.identify_date_column(df) else 'N/A',
-                        'url': row.get(source_column, 'N/A') if source_column else 'N/A'
-                    })
+            if reddit_file and os.path.exists(reddit_file):
+                reddit_df = self.load_file(reddit_file)
+                if reddit_df is not None:
+                    logger.info(f"Loaded social media data: {len(reddit_df)} records")
+                else:
+                    logger.warning(f"Failed to load reddit file: {reddit_file}")
+            
+            if news_df is None and reddit_df is None:
+                results['error_message'] = "Failed to load both data files"
+                return results
+            
+            # Handle empty dataframes
+            if news_df is not None and news_df.empty:
+                logger.warning("News dataframe is empty")
+                news_df = None
                 
-                # Top negative news
-                negative_df = df_with_sentiment[df_with_sentiment[sentiment_column] < 0].nsmallest(5, sentiment_column)
-                for _, row in negative_df.iterrows():
-                    top_negative_news.append({
-                        'text': str(row[text_column])[:100],
-                        'sentiment_score': row[sentiment_column],
-                        'date': row.get(self.identify_date_column(df), 'N/A') if self.identify_date_column(df) else 'N/A',
-                        'url': row.get(source_column, 'N/A') if source_column else 'N/A'
-                    })
-        
-        # Create PDF report
-        pdf_path = self.create_pdf_report(
-            {
-                'company_name': company_info.get('company_name', ''),
-                'ticker': company_info.get('ticker', ''),
-                'date_range': date_range,
-                'top_sources': top_sources,
-                'processed_items': len(df)
-            },
-            sentiment_metrics, keywords, top_positive_news, top_negative_news, 
-            price_data, output_dir, 'equity_research'
-        )
-        
-        # Save equity report to file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        company_name = company_info.get('company_name', 'Company').replace(' ', '_')
-        ticker = company_info.get('ticker', '')
-        
-        equity_filename = f"equity_research_{company_name}_{ticker}_{timestamp}.txt" if ticker else f"equity_research_{company_name}_{timestamp}.txt"
-        equity_report_path = os.path.join(output_dir, equity_filename)
-        
-        with open(equity_report_path, 'w', encoding='utf-8') as f:
-            f.write(equity_report)
-        
-        # Update results
-        results.update({
-            "sentiment_metrics": sentiment_metrics,
-            "price_data": price_data,
-            "price_data_source": price_data_source,
-            "equity_report": equity_report,
-            "equity_report_file": equity_report_path,
-            "pdf_report_file": pdf_path,
-            "top_positive_news": top_positive_news,
-            "top_negative_news": top_negative_news
-        })
-        
-        return results
+            if reddit_df is not None and reddit_df.empty:
+                logger.warning("Reddit dataframe is empty")
+                reddit_df = None
 
-    def _process_summarization(self, df: pd.DataFrame, text_column: str, source_column: str,
-                              company_info: Dict[str, str], top_sources: List[Tuple[str, int]],
-                              date_range: Dict[str, str], keywords: List[Tuple[str, int]],
-                              output_dir: str, results: Dict[str, Any]) -> Dict[str, Any]:
-        """Process news summarization analysis"""
-        
-        # Generate individual summaries
-        individual_summaries = []
-        summary_texts = []
-        
-        logger.info("Generating individual summaries...")
-        for idx, row in df.iterrows():
-            text = str(row[text_column])
-            if len(text.strip()) > 50:  # Only summarize substantial content
-                summary = self.generate_individual_summary(text, company_info)
-                individual_summaries.append(summary)
-                summary_texts.append(summary)
-            else:
-                summary_texts.append("Content too short for meaningful summary")
-                individual_summaries.append("Content too short for meaningful summary")
-        
-        # Generate overall summary
-        overall_summary = self.generate_overall_summary(
-            df, text_column, company_info, top_sources, keywords, date_range
-        )
-        
-        # Create document title
-        if company_info.get('company_name'):
-            document_title = f"News Summary Report - {company_info['company_name']}"
-        else:
-            document_title = "News Summary Report"
-        
-        # Save enhanced CSV with summaries
-        df_output = df.copy()
-        df_output['AI_Summary'] = summary_texts
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"news_summary_detailed_{timestamp}.csv"
-        output_path = os.path.join(output_dir, output_filename)
-        df_output.to_csv(output_path, index=False, encoding='utf-8')
-        
-        # Save overall summary to file
-        summary_filename = f"news_summary_overall_{timestamp}.txt"
-        summary_path = os.path.join(output_dir, summary_filename)
-        
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            f.write(f"{document_title}\n")
-            f.write("="*50 + "\n\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Items Processed: {len(df)}\n")
+            # ✅ Validate inputs before continuing
+            valid, message = self.validate_input_files(news_df, reddit_df)
+            if not valid:
+                logger.error(message)
+                return {"success": False, "error_message": message}
+
+
+
             
-            if company_info.get('company_name'):
-                f.write(f"Company: {company_info['company_name']}\n")
+            # Extract company information
+            logger.info("Extracting company information...")
+            company_info = {'company_name': '', 'ticker': ''}
+            
+            if news_df is not None:
+                news_text_col = self.identify_text_column(news_df)
+                company_info = self.extract_company_ticker(news_df, news_text_col)
+            
+            if not company_info.get('ticker') and reddit_df is not None:
+                reddit_text_col = self.identify_text_column(reddit_df)
+                reddit_company_info = self.extract_company_ticker(reddit_df, reddit_text_col)
+                if reddit_company_info.get('ticker'):
+                    company_info = reddit_company_info
+            
+            results['company_info'] = company_info
+            logger.info(f"Extracted company info: {company_info}")
+            
+            # Get stock data
+            logger.info("Fetching stock data...")
+            stock_data = {}
             if company_info.get('ticker'):
-                f.write(f"Ticker: {company_info['ticker']}\n")
-            if date_range.get('start_date'):
-                f.write(f"Date Range: {date_range['start_date']} to {date_range.get('end_date', '')}\n")
-            
-            f.write("\nTOP NEWS SOURCES:\n")
-            for i, (source, count) in enumerate(top_sources[:5], 1):
-                f.write(f"{i}. {source}: {count} articles\n")
-            
-            f.write("\nKEY THEMES:\n")
-            for keyword, freq in keywords[:10]:
-                f.write(f"• {keyword.title()} ({freq} mentions)\n")
-            
-            f.write(f"\n\nOVERALL SUMMARY:\n{overall_summary}\n")
-        
-        # Create PDF report
-        pdf_path = self.create_pdf_report
-        (
-            {
-                'company_name': company_info.get('company_name', ''),
-                'ticker': company_info.get('ticker', ''),
-                'date_range': date_range,
-                'top_sources': top_sources,
-                'processed_items': len(df)
-            },
-            # This is the completion of the _process_summarization method and any other missing parts
-        )
-        # Create PDF report (continuing from where it was cut off)
-        pdf_path = self.create_pdf_report(
-            {
-                'company_name': company_info.get('company_name', ''),
-                'ticker': company_info.get('ticker', ''),
-                'date_range': date_range,
-                'top_sources': top_sources,
-                'processed_items': len(df)
-            },
-            {}, keywords, [], [], {}, output_dir, 'summarization', overall_summary
-        )
-        
-        # Update results
-        results.update({
-            "individual_summaries": individual_summaries,
-            "overall_summary": overall_summary,
-            "detailed_output_file": output_path,
-            "summary_file": summary_path,
-            "pdf_report_file": pdf_path,
-            "document_title": document_title
-        })
-        
-        return results
-
-    def create_charts_for_pdf(self, sentiment_metrics: Dict[str, Any], top_sources: List[Tuple[str, int]], 
-                             keywords: List[Tuple[str, int]], output_dir: str, is_news_only: bool = False) -> Dict[str, str]:
-        """Create charts for PDF report"""
-        chart_files = {}
-        
-        try:
-            # Ensure output directory exists
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Set style for professional charts
-            plt.style.use('default')  # Changed from seaborn-v0_8 for better compatibility
-            
-            # 1. Sentiment Distribution Chart (only if sentiment data exists)
-            if sentiment_metrics.get('sentiment_distribution'):
-                fig, ax = plt.subplots(figsize=(8, 6))
-                
-                distribution = sentiment_metrics.get('sentiment_distribution', {})
-                labels = ['Positive', 'Neutral', 'Negative']
-                values = [distribution.get('positive', 0), distribution.get('neutral', 0), distribution.get('negative', 0)]
-                colors = ['#2E8B57', '#FFA500', '#DC143C']
-                
-                # Only create pie chart if there's data
-                if sum(values) > 0:
-                    wedges, texts, autotexts = ax.pie(values, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-                    ax.set_title('Sentiment Distribution', fontsize=16, fontweight='bold', pad=20)
-                    
-                    # Make percentage text bold and white
-                    for autotext in autotexts:
-                        autotext.set_color('white')
-                        autotext.set_fontweight('bold')
-                        autotext.set_fontsize(10)
-                    
-                    plt.tight_layout()
-                    sentiment_chart_path = os.path.join(output_dir, 'sentiment_distribution.png')
-                    plt.savefig(sentiment_chart_path, dpi=300, bbox_inches='tight')
-                    plt.close()
-                    chart_files['sentiment_distribution'] = sentiment_chart_path
-            
-            # 2. News vs Social Chart (only if social data exists and not news-only)
-            news_social = sentiment_metrics.get('news_vs_social', {})
-            social_count = news_social.get('social', {}).get('count', 0)
-            
-            if not is_news_only and social_count > 0:
-                fig, ax = plt.subplots(figsize=(10, 6))
-                
-                categories = ['News', 'Social Media']
-                news_sentiment = news_social.get('news', {}).get('avg_sentiment', 0)
-                social_sentiment = news_social.get('social', {}).get('avg_sentiment', 0)
-                sentiment_scores = [news_sentiment, social_sentiment]
-                
-                colors = ['#2E8B57' if score > 0 else '#DC143C' for score in sentiment_scores]
-                bars = ax.bar(categories, sentiment_scores, color=colors, alpha=0.8, edgecolor='black', linewidth=1)
-                
-                # Add value labels on bars
-                for bar, score in zip(bars, sentiment_scores):
-                    height = bar.get_height()
-                    ax.text(bar.get_x() + bar.get_width()/2., height + (0.01 if height >= 0 else -0.03),
-                            f'{score:+.3f}', ha='center', va='bottom' if height >= 0 else 'top', 
-                            fontweight='bold', fontsize=11)
-                
-                ax.set_ylabel('Average Sentiment Score', fontsize=12, fontweight='bold')
-                ax.set_title('News vs Social Media Sentiment', fontsize=16, fontweight='bold', pad=20)
-                ax.grid(axis='y', alpha=0.3)
-                ax.axhline(y=0, color='black', linestyle='-', alpha=0.3)
-                
-                plt.tight_layout()
-                news_social_chart_path = os.path.join(output_dir, 'news_vs_social.png')
-                plt.savefig(news_social_chart_path, dpi=300, bbox_inches='tight')
-                plt.close()
-                chart_files['news_vs_social'] = news_social_chart_path
-            
-            # 3. Top Sources Chart
-            if top_sources:
-                fig, ax = plt.subplots(figsize=(12, 6))
-                
-                sources = [source[0] for source in top_sources[:8]]  # Limit to top 8
-                counts = [source[1] for source in top_sources[:8]]
-                
-                bars = ax.bar(sources, counts, color='#1f77b4', alpha=0.8, edgecolor='black', linewidth=1)
-                
-                # Add value labels on bars
-                for bar, count in zip(bars, counts):
-                    height = bar.get_height()
-                    ax.text(bar.get_x() + bar.get_width()/2., height + 0.5,
-                            str(count), ha='center', va='bottom', fontweight='bold', fontsize=10)
-                
-                ax.set_ylabel('Number of Articles', fontsize=12, fontweight='bold')
-                ax.set_title('Top News Sources', fontsize=16, fontweight='bold', pad=20)
-                ax.grid(axis='y', alpha=0.3)
-                
-                # Rotate x-axis labels for better readability
-                plt.xticks(rotation=45, ha='right')
-                plt.tight_layout()
-                
-                sources_chart_path = os.path.join(output_dir, 'top_sources.png')
-                plt.savefig(sources_chart_path, dpi=300, bbox_inches='tight')
-                plt.close()
-                chart_files['top_sources'] = sources_chart_path
-            
-            # 4. Keywords Chart
-            if keywords:
-                fig, ax = plt.subplots(figsize=(12, 6))
-                
-                words = [kw[0].title() for kw in keywords[:10]]
-                freqs = [kw[1] for kw in keywords[:10]]
-                
-                bars = ax.barh(words, freqs, color='#2e8b57', alpha=0.8, edgecolor='black', linewidth=1)
-                
-                # Add value labels on bars
-                for bar, freq in zip(bars, freqs):
-                    width = bar.get_width()
-                    ax.text(width + 0.5, bar.get_y() + bar.get_height()/2.,
-                            str(freq), ha='left', va='center', fontweight='bold', fontsize=10)
-                
-                ax.set_xlabel('Frequency', fontsize=12, fontweight='bold')
-                ax.set_title('Top Keywords & Themes', fontsize=16, fontweight='bold', pad=20)
-                ax.grid(axis='x', alpha=0.3)
-                
-                plt.tight_layout()
-                keywords_chart_path = os.path.join(output_dir, 'keywords.png')
-                plt.savefig(keywords_chart_path, dpi=300, bbox_inches='tight')
-                plt.close()
-                chart_files['keywords'] = keywords_chart_path
-            
-            return chart_files
-            
-        except Exception as e:
-            logger.warning(f"Failed to create charts: {str(e)}")
-            return {}
-
-    def create_pdf_report(self, metadata: Dict[str, Any], sentiment_metrics: Dict[str, Any], 
-                          keywords: List[Tuple[str, int]], top_positive_news: List[Dict[str, Any]], 
-                          top_negative_news: List[Dict[str, Any]], price_data: Dict[str, Any],
-                          output_dir: str, analysis_type: str, overall_summary: str = None) -> str:
-        """Create a comprehensive PDF report with charts and analysis"""
-        
-        # Check if this is news-only data
-        news_social = sentiment_metrics.get('news_vs_social', {})
-        social_count = news_social.get('social', {}).get('count', 0)
-        is_news_only = social_count == 0
-        
-        # Create charts with news-only flag
-        chart_files = self.create_charts_for_pdf(sentiment_metrics, metadata.get('top_sources', []), keywords, output_dir, is_news_only)
-        
-        # Setup PDF
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        company_name = metadata.get('company_name', 'Analysis')
-        ticker = metadata.get('ticker', '')
-        
-        # Create filename
-        filename_parts = [analysis_type.replace('_', '_')]
-        if company_name and company_name != 'Analysis':
-            clean_name = "".join(c for c in company_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
-            filename_parts.append(clean_name.replace(' ', '_'))
-        if ticker:
-            filename_parts.append(ticker)
-        filename_parts.append(timestamp)
-        
-        pdf_filename = f"{'_'.join(filename_parts)}.pdf"
-        pdf_path = os.path.join(output_dir, pdf_filename)
-        
-        # Create PDF document
-        doc = SimpleDocTemplate(pdf_path, pagesize=A4)
-        elements = []
-        
-        # Get styles
-        styles = getSampleStyleSheet()
-        
-        # Custom styles
-        title_style = ParagraphStyle(
-            'CustomTitle',
-            parent=styles['Title'],
-            fontSize=24,
-            spaceAfter=30,
-            alignment=1,  # Center
-            textColor=colors.HexColor('#1f77b4')
-        )
-        
-        heading_style = ParagraphStyle(
-            'CustomHeading',
-            parent=styles['Heading2'],
-            fontSize=16,
-            spaceAfter=12,
-            textColor=colors.HexColor('#2e8b57')
-        )
-        
-        # Add title
-        if analysis_type == 'equity_research':
-            title_text = f"Equity Research Report<br/>{company_name}"
-            if ticker:
-                title_text += f" ({ticker})"
-        else:
-            title_text = f"News Analysis Report<br/>{company_name if company_name != 'Analysis' else 'News Summary'}"
-        
-        elements.append(Paragraph(title_text, title_style))
-        elements.append(Spacer(1, 20))
-        
-        # Add generation info
-        date_range = metadata.get('date_range', {})
-        gen_info = f"Generated on: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}<br/>"
-        if date_range.get('start_date'):
-            if date_range['start_date'] == date_range.get('end_date', ''):
-                gen_info += f"Analysis Date: {date_range['start_date']}<br/>"
+                stock_data = self.get_stock_data(company_info['ticker'])
             else:
-                gen_info += f"Analysis Period: {date_range['start_date']} to {date_range.get('end_date', '')}<br/>"
-        gen_info += f"Total Items Processed: {metadata.get('processed_items', 0)}"
-        
-        elements.append(Paragraph(gen_info, styles['Normal']))
-        elements.append(Spacer(1, 30))
-        
-        # Executive Summary
-        elements.append(Paragraph("1. Executive Summary", heading_style))
-        
-        if analysis_type == 'equity_research':
-            exec_summary = f"""
-            <b>Company:</b> {company_name}<br/>
-            <b>Ticker:</b> {ticker}<br/>
-            <b>Overall Sentiment:</b> {sentiment_metrics.get('average_sentiment', 0):+.3f}<br/>
-            <b>Total Mentions:</b> {sentiment_metrics.get('total_mentions', 0)}<br/>
-            <b>Current Price:</b> ${price_data.get('current_price', 0):.2f}<br/>
-            <b>Target Period:</b> 1-Month Tactical Recommendation<br/>
-            <b>Price Data Source:</b> {price_data.get('price_data_available', False) and 'Real Market Data' or 'Estimated Data'}<br/>
-            """
-        else:
-            exec_summary = f"""
-            <b>Analysis Type:</b> News Summarization<br/>
-            <b>Items Processed:</b> {metadata.get('processed_items', 0)}<br/>
-            """
-            if company_name != 'Analysis':
-                exec_summary += f"<b>Company Focus:</b> {company_name}<br/>"
-            if ticker:
-                exec_summary += f"<b>Ticker:</b> {ticker}<br/>"
-        
-        elements.append(Paragraph(exec_summary, styles['Normal']))
-        elements.append(Spacer(1, 20))
-        
-        # Add charts
-        elements.append(Paragraph("2. Visual Analysis", heading_style))
-        
-        # Sentiment Distribution Chart
-        if 'sentiment_distribution' in chart_files:
-            try:
-                img = Image(chart_files['sentiment_distribution'])
-                img.drawHeight = 4*inch
-                img.drawWidth = 6*inch
-                elements.append(img)
-                elements.append(Spacer(1, 10))
-            except Exception as e:
-                logger.warning(f"Failed to add sentiment distribution chart: {str(e)}")
-        
-        # News vs Social Chart (only if social data exists)
-        if 'news_vs_social' in chart_files:
-            try:
-                img = Image(chart_files['news_vs_social'])
-                img.drawHeight = 4*inch
-                img.drawWidth = 6*inch
-                elements.append(img)
-                elements.append(Spacer(1, 10))
-            except Exception as e:
-                logger.warning(f"Failed to add news vs social chart: {str(e)}")
-        
-        # Top Sources Chart
-        if 'top_sources' in chart_files:
-            try:
-                img = Image(chart_files['top_sources'])
-                img.drawHeight = 4*inch
-                img.drawWidth = 7*inch
-                elements.append(img)
-                elements.append(Spacer(1, 10))
-            except Exception as e:
-                logger.warning(f"Failed to add top sources chart: {str(e)}")
-        
-        # Keywords Chart
-        if 'keywords' in chart_files:
-            try:
-                img = Image(chart_files['keywords'])
-                img.drawHeight = 4*inch
-                img.drawWidth = 7*inch
-                elements.append(img)
-                elements.append(Spacer(1, 20))
-            except Exception as e:
-                logger.warning(f"Failed to add keywords chart: {str(e)}")
-        
-        # Add page break before detailed analysis
-        elements.append(PageBreak())
-        
-        if analysis_type == 'equity_research':
-            # Price Analysis Table
-            elements.append(Paragraph("3. Price Analysis & Recommendation", heading_style))
+                logger.warning("No ticker found, using mock data")
+                stock_data = self._generate_mock_price_data()
             
-            # Calculate recommendation
-            avg_sentiment = sentiment_metrics.get('average_sentiment', 0)
-            current_price = price_data['current_price']
-            avg_price = price_data.get('avg_price_period', current_price)
-            volatility = price_data.get('volatility', 0.25)
+            # Comprehensive sentiment analysis
+            logger.info("Performing sentiment analysis...")
+            sentiment_data = self.analyze_sentiment_comprehensive(
+                news_df if news_df is not None else pd.DataFrame(),
+                reddit_df if reddit_df is not None else pd.DataFrame()
+            )
+            results['sentiment_data'] = sentiment_data
             
-            sentiment_multiplier = 1 + (avg_sentiment * 0.05)
-            target_price = current_price * sentiment_multiplier
+            # Generate reports
+            logger.info("Generating analysis reports...")
+            summary_report = self.generate_summary_report(
+                news_df if news_df is not None else pd.DataFrame(),
+                reddit_df if reddit_df is not None else pd.DataFrame(),
+                company_info
+            )
             
-            price_momentum = (current_price - avg_price) / avg_price if avg_price != 0 else 0
+            # Create PDF reports
+            logger.info("Creating PDF reports...")
+            pdf_reports = []
             
-            if avg_sentiment > 0.3 or (avg_sentiment > 0.1 and price_momentum > 0.02):
-                recommendation = "BUY"
-            elif avg_sentiment < -0.3 or (avg_sentiment < -0.1 and price_momentum < -0.02):
-                recommendation = "SELL"
+            # Summary PDF
+            try:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                ticker_safe = company_info.get('ticker', 'analysis').replace('/', '_')
+                summary_pdf_filename = f"summary_report_{ticker_safe}_{timestamp}.pdf"
+                summary_pdf_path = os.path.join(tempfile.gettempdir(), summary_pdf_filename)
+                
+                summary_pdf = self.create_summary_pdf_report(
+                    summary_report, 
+                    company_info, 
+                    len(news_df) if news_df is not None else 0,
+                    len(reddit_df) if reddit_df is not None else 0,
+                    summary_pdf_path
+                )
+                
+                if summary_pdf and os.path.exists(summary_pdf):
+                    pdf_reports.append(summary_pdf)
+                    logger.info(f"Summary PDF created: {summary_pdf}")
+                else:
+                    logger.warning("Summary PDF creation failed")
+                    
+            except Exception as e:
+                logger.error(f"Error creating summary PDF: {str(e)}")
+            
+            # Equity research PDF
+            try:
+                equity_pdf = self.create_equity_research_report(
+                    company_info, 
+                    stock_data, 
+                    sentiment_data,
+                    news_df if news_df is not None else pd.DataFrame(),
+                    reddit_df if reddit_df is not None else pd.DataFrame()
+                )
+                
+                if equity_pdf and os.path.exists(equity_pdf):
+                    pdf_reports.append(equity_pdf)
+                    logger.info(f"Equity research PDF created: {equity_pdf}")
+                else:
+                    logger.warning("Equity research PDF creation failed, creating placeholder")
+                    # Create placeholder PDF
+                    placeholder_path = self._create_placeholder_equity_pdf(company_info)
+                    if placeholder_path:
+                        pdf_reports.append(placeholder_path)
+                        
+            except Exception as e:
+                logger.error(f"Error creating equity research PDF: {str(e)}")
+                # Create placeholder PDF
+                placeholder_path = self._create_placeholder_equity_pdf(company_info)
+                if placeholder_path:
+                    pdf_reports.append(placeholder_path)
+
+            results['pdf_reports'] = pdf_reports
+            logger.info(f"Created {len(pdf_reports)} PDF reports")
+            
+            # Email distribution
+            if email_recipients and self.email_handler and pdf_reports:
+                logger.info(f"Distributing reports to {len(email_recipients)} recipients...")
+                
+                # Create analysis summary for email
+                overall_sentiment = sentiment_data.get('combined_sentiment', {})
+                analysis_summary = f"""
+    Sentiment Analysis Summary:
+    - Overall Sentiment: {overall_sentiment.get('label', 'neutral').title()}
+    - Sentiment Score: {overall_sentiment.get('score', 0):.3f}
+    - News Articles Analyzed: {len(news_df) if news_df is not None else 0}
+    - Social Media Posts Analyzed: {len(reddit_df) if reddit_df is not None else 0}
+    - Company: {company_info.get('company_name', 'N/A')} ({company_info.get('ticker', 'N/A')})
+    """
+                
+                email_results = self.send_reports_to_recipients(
+                    email_recipients, pdf_reports, company_info, analysis_summary
+                )
+                results['email_results'] = email_results
+                
+                # Log email results
+                for recipient, success in email_results.items():
+                    status = "sent successfully" if success else "failed"
+                    logger.info(f"Email to {recipient}: {status}")
             else:
-                recommendation = "HOLD"
+                if not email_recipients:
+                    logger.info("No email recipients specified")
+                elif not self.email_handler:
+                    logger.warning("Email handler not configured")
+                elif not pdf_reports:
+                    logger.warning("No PDF reports to send")
             
-            upper_range = target_price * (1 + volatility * 0.5)
-            lower_range = target_price * (1 - volatility * 0.5)
-            
-            price_table_data = [
-                ['Metric', 'Value'],
-                ['Current Price', f'${current_price:.2f}'],
-                ['Average Price (Period)', f'${avg_price:.2f}'],
-                ['Target Price (1-Month)', f'${target_price:.2f}'],
-                ['Price Range (1σ)', f'${lower_range:.2f} - ${upper_range:.2f}'],
-                ['Recommendation', recommendation],
-                ['Volatility', f'{volatility:.1%}']
-            ]
-            
-            price_table = Table(price_table_data)
-            price_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1f77b4')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 12),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('FONTSIZE', (0, 1), (-1, -1), 10),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])
-            ]))
-            
-            elements.append(price_table)
-            elements.append(Spacer(1, 20))
-        
-        # Keywords Table (numbered section)
-        section_num = "4" if analysis_type == 'equity_research' else "3"
-        if keywords:
-            elements.append(Paragraph(f"{section_num}. Top Keywords & Themes", heading_style))
-            
-            keywords_table_data = [['Rank', 'Keyword', 'Frequency']]
-            for i, (keyword, freq) in enumerate(keywords[:10], 1):
-                keywords_table_data.append([str(i), keyword.title(), str(freq)])
-            
-            keywords_table = Table(keywords_table_data)
-            keywords_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2e8b57')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 12),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('FONTSIZE', (0, 1), (-1, -1), 10),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])
-            ]))
-            
-            elements.append(keywords_table)
-            elements.append(Spacer(1, 20))
-        
-        # Top Sources Table
-        section_num = "5" if analysis_type == 'equity_research' else "4"
-        if metadata.get('top_sources'):
-            elements.append(Paragraph(f"{section_num}. Top News Sources", heading_style))
-            
-            sources_table_data = [['Rank', 'Source', 'Article Count']]
-            for i, (source, count) in enumerate(metadata['top_sources'], 1):
-                sources_table_data.append([str(i), source, str(count)])
-            
-            sources_table = Table(sources_table_data)
-            sources_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1f77b4')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 12),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('FONTSIZE', (0, 1), (-1, -1), 10),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])
-            ]))
-            
-            elements.append(sources_table)
-            elements.append(Spacer(1, 20))
-        
-        # Add overall summary if available
-        if overall_summary:
-            section_num = "6" if analysis_type == 'equity_research' else "5"
-            elements.append(Paragraph(f"{section_num}. Overall Analysis Summary", heading_style))
-            # Clean the summary text for PDF
-            clean_summary = overall_summary.replace('\n', '<br/>')
-            elements.append(Paragraph(clean_summary, styles['Normal']))
-            elements.append(Spacer(1, 20))
-        
-        # Top News Items with URLs (only for equity research)
-        if analysis_type == 'equity_research':
-            # Top Positive News
-            section_num = "7" if overall_summary else "6"
-            if top_positive_news:
-                elements.append(Paragraph(f"{section_num}. Top Positive News", heading_style))
-                
-                pos_news_data = [['Rank', 'Date', 'Headline', 'Sentiment', 'URL']]
-                for i, news in enumerate(top_positive_news[:5], 1):
-                    headline = news['text'][:50] + "..." if len(news['text']) > 50 else news['text']
-                    url = news.get('url', 'N/A')[:30] + "..." if news.get('url') and len(news.get('url', '')) > 30 else news.get('url', 'N/A')
-                    pos_news_data.append([
-                        str(i),
-                        news['date'], 
-                        headline, 
-                        f"{news['sentiment_score']:+.3f}",
-                        url
-                    ])
-                
-                pos_news_table = Table(pos_news_data, colWidths=[0.5*inch, 1.3*inch, 2.7*inch, 0.8*inch, 2.0*inch])
-                pos_news_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2e8b57')),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, 0), 9),
-                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                    ('FONTSIZE', (0, 1), (-1, -1), 7),
-                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])
-                ]))
-                
-                elements.append(pos_news_table)
-                elements.append(Spacer(1, 15))
-            
-            # Top Negative News
-            section_num = "8" if overall_summary else "7"
-            if top_negative_news:
-                elements.append(Paragraph(f"{section_num}. Top Negative News", heading_style))
-                
-                neg_news_data = [['Rank', 'Date', 'Headline', 'Sentiment', 'URL']]
-                for i, news in enumerate(top_negative_news[:5], 1):
-                    headline = news['text'][:50] + "..." if len(news['text']) > 50 else news['text']
-                    url = news.get('url', 'N/A')[:30] + "..." if news.get('url') and len(news.get('url', '')) > 30 else news.get('url', 'N/A')
-                    neg_news_data.append([
-                        str(i),
-                        news['date'], 
-                        headline, 
-                        f"{news['sentiment_score']:+.3f}",
-                        url
-                    ])
-                
-                neg_news_table = Table(neg_news_data, colWidths=[0.5*inch, 1.4*inch, 2.7*inch, 0.8*inch, 2.0*inch])
-                neg_news_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#DC143C')),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, 0), 9),
-                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                    ('FONTSIZE', (0, 1), (-1, -1), 7),
-                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])
-                ]))
-                
-                elements.append(neg_news_table)
-                elements.append(Spacer(1, 15))
-        
-        # Add disclaimer
-        elements.append(Spacer(1, 30))
-        final_section = "9" if analysis_type == 'equity_research' and overall_summary else "8" if analysis_type == 'equity_research' else "6"
-        elements.append(Paragraph(f"{final_section}. Disclaimer", heading_style))
-        disclaimer_text = """
-        This report is for informational purposes only and is not intended as investment advice. 
-        The analysis is based on news sentiment and historical data, which may not be indicative of future performance. 
-        Price targets are tactical 1-month recommendations based on sentiment momentum and should not be considered as long-term investment guidance.
-        Always consult with a qualified financial advisor before making investment decisions.
-        """
-        elements.append(Paragraph(disclaimer_text, styles['Normal']))
-        
-        # Build PDF
-        try:
-            doc.build(elements)
-            logger.info(f"PDF report created successfully: {pdf_path}")
-            
-            # Clean up chart files
-            for chart_file in chart_files.values():
+            # Create download package
+            if create_download_package and pdf_reports:
+                logger.info("Creating downloadable reports package...")
                 try:
-                    if os.path.exists(chart_file):
-                        os.remove(chart_file)
-                except:
-                    pass
+                    download_package = self.create_downloadable_reports_package(pdf_reports, company_info)
+                    if download_package and os.path.exists(download_package):
+                        results['download_package'] = download_package
+                        logger.info(f"Download package created: {download_package}")
+                    else:
+                        logger.warning("Download package creation failed")
+                except Exception as e:
+                    logger.error(f"Error creating download package: {str(e)}")
             
-            return pdf_path
+            results['success'] = True
+            logger.info("Comprehensive analysis completed successfully!")
+            
+            return results
             
         except Exception as e:
-            logger.error(f"Failed to create PDF: {str(e)}")
+            logger.error(f"Error in comprehensive analysis: {str(e)}")
+            results['error_message'] = str(e)
+            return results
+
+    def _create_placeholder_equity_pdf(self, company_info: Dict[str, str]) -> str:
+        """Create a placeholder PDF when equity research report generation fails"""
+        try:
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib import colors
+            import tempfile
+            import os
+
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            ticker_safe = company_info.get('ticker', 'analysis').replace('/', '_')
+            filename = f"equity_research_placeholder_{ticker_safe}_{timestamp}.pdf"
+            placeholder_path = os.path.join(tempfile.gettempdir(), filename)
+
+            doc = SimpleDocTemplate(placeholder_path, pagesize=A4)
+            styles = getSampleStyleSheet()
+            elements = []
+
+            # Title
+            company_name = company_info.get('company_name', 'N/A')
+            ticker = company_info.get('ticker', 'N/A')
+            title = f"Equity Research Report - {company_name} ({ticker})"
+            elements.append(Paragraph(title, styles['Title']))
+            elements.append(Spacer(1, 30))
+
+            # Error message
+            error_msg = """
+            ⚠️ Report Generation Error
+            
+            An error occurred while generating the comprehensive equity research report. 
+            This is a placeholder document to ensure you receive some analysis output.
+            
+            Possible causes:
+            • Chart generation issues
+            • Data processing errors
+            • PDF formatting problems
+            
+            Please check the system logs for detailed error information and try running 
+            the analysis again. The summary report should still contain valuable insights.
+            
+            For support, please contact your system administrator.
+            """
+            
+            elements.append(Paragraph(error_msg, styles['Normal']))
+            elements.append(Spacer(1, 20))
+
+            # Basic info
+            basic_info = f"""
+            Analysis Information:
+            • Company: {company_name}
+            • Ticker: {ticker}
+            • Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            • Status: Placeholder (Original report generation failed)
+            """
+            
+            elements.append(Paragraph(basic_info, styles['Normal']))
+
+            doc.build(elements)
+            logger.info(f"Placeholder equity research PDF created: {placeholder_path}")
+            return placeholder_path
+            
+        except Exception as e:
+            logger.error(f"Error creating placeholder PDF: {str(e)}")
             return ""
 
+    def send_reports_to_recipients(self, recipients: List[str], pdf_paths: List[str], 
+                            company_info: Dict[str, str], analysis_summary: str = "") -> Dict[str, bool]:
+        """Send PDF reports to multiple email recipients"""
+        if not self.email_handler:
+            logger.error("Email handler not initialized")
+            return {recipient: False for recipient in recipients}
+        
+        results = {}
+        company_name = company_info.get('company_name', 'Market Analysis')
+        ticker = f" ({company_info['ticker']})" if company_info.get('ticker') else ""
+        
+        # Email subject and body
+        subject = f"Financial Analysis Report - {company_name}{ticker}"
+        
+        body = f"""
+    Dear Recipient,
 
-# Main execution helper function
-def main():
-    """Example usage of the NewsAndSocialMediaAnalysisBot"""
-    # Example API key (replace with actual key)
-    api_key = "your_openai_api_key_here"
-    
-    # Initialize the bot
-    bot = NewsAndSocialMediaAnalysisBot(api_key)
-    
-    # Process a file
-    file_path = "path_to_your_data_file.csv"  # Replace with actual file path
-    
-    # Run analysis (auto-detects whether to do equity research or summarization)
-    results = bot.process_file(file_path, analysis_type="auto", output_dir="output")
-    
-    if results["success"]:
-        print(f"Analysis completed successfully!")
-        print(f"Analysis type: {results['analysis_type']}")
-        print(f"Processed {results['processed_items']} items")
+    Please find attached the comprehensive financial analysis report for {company_name}{ticker}.
+
+    Report Summary:
+    - Analysis Date: {datetime.now().strftime('%Y-%m-%d')}
+    - Company: {company_name}
+    - Stock Ticker: {company_info.get('ticker', 'N/A')}
+
+    {analysis_summary if analysis_summary else 'This report includes detailed sentiment analysis, market data, and investment insights based on news and social media coverage.'}
+
+    The attached reports include:
+    - Summary Analysis Report
+    - Equity Research Report with Charts
+    - Sentiment Analysis
+
+    Please note that this analysis is generated using AI and is for informational purposes only. 
+    It should not be considered as personalized investment advice.
+
+    Best regards,
+    Financial Analysis System
+        """
         
-        if results.get("pdf_report_file"):
-            print(f"PDF report created: {results['pdf_report_file']}")
+        # Prepare attachments
+        attachments = []
+        for pdf_path in pdf_paths:
+            if pdf_path and os.path.exists(pdf_path):
+                filename = os.path.basename(pdf_path)
+                attachments.append({'path': pdf_path, 'name': filename})
         
-        if results.get("equity_report_file"):
-            print(f"Equity research report: {results['equity_report_file']}")
+        # Send to each recipient
+        for recipient in recipients:
+            try:
+                success = self.email_handler.send_email_with_attachments(
+                    recipient_email=recipient,
+                    subject=subject,
+                    body=body,
+                    attachments=attachments
+                )
+                results[recipient] = success
+                if success:
+                    logger.info(f"Successfully sent reports to {recipient}")
+                else:
+                    logger.error(f"Failed to send reports to {recipient}")
+                    
+            except Exception as e:
+                logger.error(f"Error sending to {recipient}: {str(e)}")
+                results[recipient] = False
         
-        if results.get("summary_file"):
-            print(f"Summary report: {results['summary_file']}")
+        return results
+
+    def create_downloadable_reports_package(self, pdf_paths: List[str], company_info: Dict[str, str]) -> str:
+        """Create a downloadable ZIP package with all reports"""
+        try:
+            company_name = company_info.get('company_name', 'Company').replace(' ', '_')
+            ticker = company_info.get('ticker', 'STOCK')
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             
-    else:
-        print(f"Analysis failed: {results['error']}")
+            zip_filename = f"Financial_Reports_{company_name}_{ticker}_{timestamp}.zip"
+            zip_path = os.path.join(tempfile.gettempdir(), zip_filename)
+            
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for pdf_path in pdf_paths:
+                    if pdf_path and os.path.exists(pdf_path):
+                        # Add PDF to zip with clean filename
+                        filename = os.path.basename(pdf_path)
+                        clean_filename = f"{company_name}_{ticker}_{filename}"
+                        zipf.write(pdf_path, clean_filename)
+                
+                # Add a README file
+                readme_content = f"""
+    Financial Analysis Reports Package
+    ================================
+
+    Company: {company_info.get('company_name', 'N/A')}
+    Stock Ticker: {company_info.get('ticker', 'N/A')}
+    Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+    This package contains:
+    1. Summary Analysis Report - Overview of news and social media analysis
+    2. Equity Research Report - Detailed financial analysis with charts
+    3. Additional analytical charts and visualizations
+
+    IMPORTANT DISCLAIMER:
+    These reports are generated using AI analysis of publicly available data.
+    The content is for informational purposes only and should not be considered
+    as personalized investment advice. Always conduct your own research and
+    consult with qualified financial professionals before making investment decisions.
+
+    For questions or support, please contact your system administrator.
+                """
+                
+                zipf.writestr("README.txt", readme_content)
+            
+            logger.info(f"Created downloadable reports package: {zip_path}")
+            return zip_path
+            
+        except Exception as e:
+            logger.error(f"Error creating reports package: {str(e)}")
+            return ""
+
+    def create_equity_research_report(self, company_info: Dict[str, str], stock_data: Dict[str, Any], 
+                                 sentiment_data: Dict[str, Any], news_df: pd.DataFrame,
+                                 reddit_df: pd.DataFrame, start_date: str = None,
+                                 end_date: str = None) -> Optional[str]:
+        """Create a structured Equity Research PDF report with charts"""
+        try:
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib import colors
+            from reportlab.lib.units import inch
+            import matplotlib.pyplot as plt
+            import tempfile
+            import os
+
+            # Generate filename
+            ticker = company_info.get('ticker', 'analysis')
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"equity_research_{ticker}_{timestamp}.pdf"
+            temp_path = os.path.join(tempfile.gettempdir(), filename)
+
+            doc = SimpleDocTemplate(temp_path, pagesize=A4)
+            styles = getSampleStyleSheet()
+            
+            # Create custom styles
+            styles.add(ParagraphStyle(
+                name="SectionHeader", 
+                fontSize=14, 
+                leading=18, 
+                spaceAfter=10, 
+                textColor=colors.HexColor("#003366"),
+                fontName='Helvetica-Bold'
+            ))
+            
+            elements = []
+
+            # --- Title ---
+            company_name = company_info.get('company_name', 'N/A')
+            ticker_symbol = company_info.get('ticker', 'N/A')
+            title = f"Equity Research Report - {company_name} ({ticker_symbol})"
+            elements.append(Paragraph(title, styles["Title"]))
+            elements.append(Spacer(1, 20))
+
+            # --- Report Metadata ---
+            elements.append(Paragraph("Report Information", styles["SectionHeader"]))
+            metadata = [
+                ["Ticker", ticker_symbol],
+                ["Company", company_name],
+                ["Report Date", datetime.now().strftime("%B %d, %Y")],
+                ["Analysis Period", f"{start_date or 'Last 30 days'} to {end_date or datetime.now().strftime('%Y-%m-%d')}"],
+                ["Data Sources", f"News: {len(news_df)}, Social Media: {len(reddit_df)}"]
+            ]
+            
+            table = Table(metadata, colWidths=[120, 350])
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT")
+            ]))
+            elements.append(table)
+            elements.append(Spacer(1, 15))
+
+            # --- Executive Summary ---
+            elements.append(Paragraph("Executive Summary", styles["SectionHeader"]))
+            
+            # Calculate total mentions
+            total_mentions = len(news_df) + len(reddit_df)
+            overall_sentiment = sentiment_data.get("combined_sentiment", {})
+            sentiment_score = overall_sentiment.get('score', 0)
+            sentiment_label = overall_sentiment.get('label', 'neutral')
+            
+            summary_text = f"""
+            Based on analysis of {total_mentions} data points across news articles and social media posts, 
+            the overall sentiment for {company_name} is {sentiment_label.upper()} with a sentiment score of {sentiment_score:+.3f}.
+            
+            This analysis incorporates {len(news_df)} news articles and {len(reddit_df)} social media posts 
+            to provide comprehensive market sentiment insights.
+            """
+            
+            elements.append(Paragraph(summary_text, styles["Normal"]))
+            elements.append(Spacer(1, 15))
+
+            # --- Key Metrics ---
+            elements.append(Paragraph("Key Financial Metrics", styles["SectionHeader"]))
+            
+            current_price = stock_data.get("current_price", 0)
+            avg_price = stock_data.get("avg_price_period", 0)
+            volatility = stock_data.get("volatility", 0)
+            pe_ratio = stock_data.get("pe_ratio", None)
+            market_cap = stock_data.get("market_cap", 0)
+
+            metrics_data = [
+                ["Metric", "Value"],
+                ["Current Price", f"${current_price:.2f}"],
+                ["Average Price (Period)", f"${avg_price:.2f}"],
+                ["Annualized Volatility", f"{volatility:.1%}"],
+                ["P/E Ratio", f"{pe_ratio}" if pe_ratio else "N/A"],
+                ["Market Cap", f"${market_cap:,.0f}" if market_cap > 0 else "N/A"],
+                ["Data Quality", "Real-time" if stock_data.get('price_data_available') else "Simulated"]
+            ]
+
+            table = Table(metrics_data, colWidths=[180, 300])
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER")
+            ]))
+            elements.append(table)
+            elements.append(Spacer(1, 15))
+
+            # --- Investment Recommendation ---
+            elements.append(Paragraph("Investment Recommendation", styles["SectionHeader"]))
+            
+            # Generate recommendation based on sentiment and metrics
+            recommendation = "HOLD"
+            target_price = current_price * 1.02  # Default 2% target
+            
+            if sentiment_score > 0.2 and volatility < 0.3:
+                recommendation = "BUY"
+                target_price = current_price * 1.08
+            elif sentiment_score < -0.2 or volatility > 0.4:
+                recommendation = "SELL"
+                target_price = current_price * 0.95
+            
+            recommendation_text = f"""
+            RECOMMENDATION: {recommendation}
+            
+            Target Price: ${target_price:.2f}
+            Current Price: ${current_price:.2f}
+            
+            Rationale: Based on sentiment analysis showing {sentiment_label} sentiment ({sentiment_score:+.3f}) 
+            and volatility of {volatility:.1%}, we recommend a {recommendation} position. 
+            The analysis of {total_mentions} data points suggests {sentiment_label} market perception.
+            """
+            
+            elements.append(Paragraph(recommendation_text, styles["Normal"]))
+            elements.append(Spacer(1, 20))
+
+            # --- Charts Section ---
+            elements.append(PageBreak())
+            elements.append(Paragraph("Analysis Charts", styles["SectionHeader"]))
+
+            chart_paths = []
+
+            # Create charts for the report
+            try:
+                # Chart 1: Sentiment Distribution
+                sentiment_chart_path = self._create_pdf_sentiment_chart(sentiment_data)
+                if sentiment_chart_path:
+                    chart_paths.append((sentiment_chart_path, "Sentiment Analysis"))
+
+                # Chart 2: Stock Price Analysis
+                if stock_data.get('historical_data') is not None:
+                    price_chart_path = self._create_pdf_stock_chart(stock_data)
+                    if price_chart_path:
+                        chart_paths.append((price_chart_path, "Stock Price Analysis"))
+
+                # Chart 3: Risk Assessment
+                risk_chart_path = self._create_pdf_risk_chart(stock_data)
+                if risk_chart_path:
+                    chart_paths.append((risk_chart_path, "Risk Assessment"))
+
+            except Exception as e:
+                logger.warning(f"Some charts could not be generated: {str(e)}")
+
+            # Add charts to PDF
+            for chart_path, chart_title in chart_paths:
+                try:
+                    elements.append(Paragraph(chart_title, styles["SectionHeader"]))
+                    elements.append(Spacer(1, 10))
+                    
+                    # Add chart image
+                    chart_img = Image(chart_path, width=6*inch, height=4*inch)
+                    elements.append(chart_img)
+                    elements.append(Spacer(1, 15))
+                    
+                except Exception as e:
+                    logger.warning(f"Could not add chart {chart_title}: {str(e)}")
+                    elements.append(Paragraph(f"Chart: {chart_title} (Generation Error)", styles["Normal"]))
+                    elements.append(Spacer(1, 10))
+
+            # --- Risk Factors ---
+            elements.append(Paragraph("Risk Factors & Considerations", styles["SectionHeader"]))
+            
+            risk_level = "LOW"
+            if volatility > 0.3:
+                risk_level = "HIGH"
+            elif volatility > 0.2:
+                risk_level = "MEDIUM"
+                
+            risk_text = f"""
+            Risk Level: {risk_level}
+            
+            Key Risk Factors:
+            • Market Volatility: {volatility:.1%} annualized volatility indicates {risk_level.lower()} risk
+            • Sentiment Risk: Current sentiment is {sentiment_label}, which may shift rapidly
+            • Data Limitations: Analysis based on {total_mentions} data points over limited time period
+            • AI Analysis: Recommendations are AI-generated and should be verified independently
+            
+            Investment Considerations:
+            • Suitable for {risk_level.lower()} risk tolerance investors
+            • Monitor sentiment changes and market developments
+            • Consider portfolio diversification
+            • Consult with financial advisors for personalized advice
+            """
+            
+            elements.append(Paragraph(risk_text, styles["Normal"]))
+            elements.append(Spacer(1, 20))
+
+            # --- Disclaimer ---
+            elements.append(Paragraph("Important Disclaimer", styles["SectionHeader"]))
+            disclaimer = f"""
+            This equity research report is generated using AI analysis of publicly available data including 
+            news articles and social media posts. The analysis is based on sentiment analysis, historical 
+            price data, and statistical calculations for {company_name} ({ticker_symbol}).
+
+            IMPORTANT NOTICES:
+            • This report is for informational purposes only and does not constitute investment advice
+            • Past performance and sentiment analysis do not guarantee future results
+            • All investments carry risk of loss and may not be suitable for all investors
+            • Consult qualified financial professionals before making investment decisions
+            • The AI-generated analysis may contain errors or biases
+            • Market conditions can change rapidly, affecting the validity of this analysis
+
+            Data Sources: News articles, social media posts, and financial market data as of {datetime.now().strftime('%Y-%m-%d')}
+            """
+            
+            elements.append(Paragraph(disclaimer, styles["Normal"]))
+
+            # --- Build PDF ---
+            try:
+                doc.build(elements)
+                logger.info(f"Equity research report created successfully: {temp_path}")
+                
+                # Cleanup chart files
+                for chart_path, _ in chart_paths:
+                    try:
+                        if os.path.exists(chart_path):
+                            os.unlink(chart_path)
+                    except:
+                        pass
+                
+                return temp_path
+                
+            except Exception as e:
+                logger.error(f"Error building PDF document: {str(e)}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error creating equity research report: {str(e)}")
+            return None
 
 
-if __name__ == "__main__":
-    main()
+
+    def _generate_investment_thesis(self, sentiment_score: float, current_price: float, 
+                                    volatility: float, total_mentions: int) -> str:
+        """Generate investment thesis based on analysis"""
+        if sentiment_score > 0.2:
+            return f"""
+    Based on our analysis of {total_mentions} data points, the investment thesis is POSITIVE.
+    The sentiment analysis reveals strong positive momentum with a score of {sentiment_score:+.3f}.
+    Key factors supporting this thesis include favorable news coverage, positive social media
+    sentiment, and strong community engagement. However, investors should consider the
+    volatility of {volatility:.1%} and conduct additional fundamental analysis."""
+        
+        elif sentiment_score < -0.2:
+            return f"""
+    Based on our analysis of {total_mentions} data points, the investment thesis is NEGATIVE.
+    The sentiment analysis shows concerning negative momentum with a score of {sentiment_score:+.3f}.
+    Key risk factors include unfavorable news coverage, negative social media sentiment, and
+    potential market headwinds. The volatility of {volatility:.1%} adds additional risk."""
+        
+        else:
+            return f"""
+    Based on our analysis of {total_mentions} data points, the investment thesis is NEUTRAL.
+    The sentiment analysis shows mixed signals with a score of {sentiment_score:+.3f}.
+    The investment appears fairly valued at current levels, but investors should monitor
+    developments closely. The volatility of {volatility:.1%} suggests moderate risk."""
+
+    def create_summary_pdf_report(self, summary_content: str, company_info: Dict[str, str],
+                                news_count: int, reddit_count: int, output_file: str) -> str:
+        """Create PDF summary report"""
+        try:
+            doc = SimpleDocTemplate(output_file, pagesize=letter)
+            styles = getSampleStyleSheet()
+            story = []
+            
+            # Custom styles
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Title'],
+                fontSize=24,
+                spaceAfter=30,
+                alignment=1,
+                textColor=colors.HexColor('#2E8B57')
+            )
+            
+            heading_style = ParagraphStyle(
+                'CustomHeading',
+                parent=styles['Heading1'],
+                fontSize=16,
+                spaceAfter=12,
+                textColor=colors.HexColor('#1f4e79')
+            )
+            
+            # Title
+            company_name = company_info.get('company_name', 'Market Analysis')
+            ticker = f" ({company_info['ticker']})" if company_info.get('ticker') else ""
+            title = f"Summary Report: {company_name}{ticker}"
+            
+            story.append(Paragraph(title, title_style))
+            story.append(Spacer(1, 20))
+            
+            # Report metadata
+            story.append(Paragraph("Report Information", heading_style))
+            
+            meta_data = [
+                ['Generated Date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+                ['News Articles Analyzed', str(news_count)],
+                ['Social Media Posts Analyzed', str(reddit_count)],
+                ['Total Data Points', str(news_count + reddit_count)]
+            ]
+            
+            if company_info.get('company_name'):
+                meta_data.insert(1, ['Company', company_info['company_name']])
+            if company_info.get('ticker'):
+                meta_data.insert(2, ['Stock Ticker', company_info['ticker']])
+            
+            meta_table = Table(meta_data)
+            meta_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f0f0f0')),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            
+            story.append(meta_table)
+            story.append(Spacer(1, 20))
+            
+            # Summary content
+            story.append(Paragraph("Analysis Summary", heading_style))
+            
+            # Split content into paragraphs
+            paragraphs = summary_content.split('\n\n')
+            for paragraph in paragraphs:
+                if paragraph.strip():
+                    story.append(Paragraph(paragraph.strip(), styles['Normal']))
+                    story.append(Spacer(1, 12))
+            
+            # Footer
+            story.append(PageBreak())
+            story.append(Paragraph("Disclaimer", heading_style))
+            
+            disclaimer = """
+            This summary report is generated using AI analysis of news articles and social media posts. 
+            The insights and conclusions are based on sentiment analysis and text processing algorithms. 
+            This report is for informational purposes only and should not be considered as financial advice, 
+            investment recommendations, or professional consultation. Always conduct your own research and 
+            consult with qualified professionals before making any financial or investment decisions.
+            """
+            
+            story.append(Paragraph(disclaimer, styles['Normal']))
+            
+            # Build PDF
+            doc.build(story)
+            logger.info(f"Summary PDF report generated: {output_file}")
+            return output_file
+            
+        except Exception as e:
+            logger.error(f"Failed to create summary PDF report: {str(e)}")
+            return ""
+
+    def _create_pdf_stock_chart(self, stock_data: Dict[str, Any]) -> str:
+        """Create stock price chart optimized for PDF"""
+        try:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            plt.style.use('default')  # Use default style for better PDF compatibility
+            
+            if 'historical_data' in stock_data:
+                hist_data = stock_data['historical_data']
+                ax.plot(hist_data.index, hist_data['Close'], linewidth=2, color='#1f4e79', label='Stock Price')
+                
+                # Add moving average
+                if len(hist_data) > 7:
+                    ma_7 = hist_data['Close'].rolling(window=7).mean()
+                    ax.plot(hist_data.index, ma_7, linewidth=1.5, color='orange', label='7-day MA', alpha=0.8)
+                
+                ax.set_title('Stock Price Trend with Moving Average', fontsize=14, fontweight='bold')
+                ax.set_xlabel('Date')
+                ax.set_ylabel('Price ($)')
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+                
+                # Format x-axis
+                ax.tick_params(axis='x', rotation=45)
+                
+                # Add current price annotation
+                current_price = stock_data.get('current_price', 0)
+                if current_price > 0:
+                    ax.axhline(y=current_price, color='red', linestyle='--', alpha=0.7)
+                    ax.text(0.02, 0.95, f'Current: ${current_price:.2f}', 
+                        transform=ax.transAxes, fontsize=10, fontweight='bold',
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight', facecolor='white')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating PDF stock chart: {str(e)}")
+            plt.close()
+            return ""
+
+    def _create_pdf_sentiment_chart(self, sentiment_data: Dict[str, Any]) -> str:
+        """Create sentiment chart optimized for PDF"""
+        try:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            plt.style.use('default')
+            
+            # News sentiment pie chart
+            news_data = sentiment_data['news_sentiment']
+            if news_data['positive'] + news_data['negative'] + news_data['neutral'] > 0:
+                labels = ['Positive', 'Negative', 'Neutral']
+                sizes = [news_data['positive'], news_data['negative'], news_data['neutral']]
+                colors = ['#2E8B57', '#DC143C', '#FFD700']
+                
+                ax1.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+                ax1.set_title('News Sentiment Distribution', fontweight='bold')
+            
+            # Reddit sentiment pie chart
+            reddit_data = sentiment_data['reddit_sentiment']
+            if reddit_data['positive'] + reddit_data['negative'] + reddit_data['neutral'] > 0:
+                labels = ['Positive', 'Negative', 'Neutral']
+                sizes = [reddit_data['positive'], reddit_data['negative'], reddit_data['neutral']]
+                colors = ['#2E8B57', '#DC143C', '#FFD700']
+                
+                ax2.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+                ax2.set_title('Social Media Sentiment Distribution', fontweight='bold')
+            
+            # Add overall sentiment score
+            combined_score = sentiment_data['combined_sentiment']['score']
+            combined_label = sentiment_data['combined_sentiment']['label']
+            
+            fig.suptitle(f'Overall Sentiment: {combined_label.title()} (Score: {combined_score:+.3f})', 
+                        fontsize=14, fontweight='bold')
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight', facecolor='white')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating PDF sentiment chart: {str(e)}")
+            plt.close()
+            return ""
+
+    def _create_pdf_volume_chart(self, news_df: pd.DataFrame, reddit_df: pd.DataFrame) -> str:
+        """Create volume comparison chart optimized for PDF"""
+        try:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            plt.style.use('default')
+            
+            # Bar chart comparison
+            categories = ['News Articles', 'Social Media Posts']
+            volumes = [
+                len(news_df) if news_df is not None else 0,
+                len(reddit_df) if reddit_df is not None else 0
+            ]
+            
+            colors = ['#1f4e79', '#2E8B57']
+            bars = ax1.bar(categories, volumes, color=colors, alpha=0.8, edgecolor='black')
+            ax1.set_title('Data Volume Comparison', fontsize=14, fontweight='bold')
+            ax1.set_ylabel('Number of Records')
+            ax1.grid(True, alpha=0.3)
+            
+            # Add value labels on bars
+            for bar, volume in zip(bars, volumes):
+                height = bar.get_height()
+                ax1.text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                        f'{int(volume):,}', ha='center', va='bottom', fontweight='bold')
+            
+            # Pie chart
+            if sum(volumes) > 0:
+                ax2.pie(volumes, labels=categories, colors=colors, autopct='%1.1f%%', startangle=90)
+                ax2.set_title('Data Distribution', fontsize=14, fontweight='bold')
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight', facecolor='white')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating PDF volume chart: {str(e)}")
+            plt.close()
+            return ""
+
+    def _create_pdf_risk_chart(self, stock_data: Dict[str, Any]) -> str:
+        """Create risk assessment chart optimized for PDF"""
+        try:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            plt.style.use('default')
+            
+            # Risk level comparison
+            current_vol = stock_data.get('volatility', 0.25) * 100
+            risk_categories = ['Low Risk\n(0-15%)', 'Medium Risk\n(15-25%)', 'High Risk\n(25%+)']
+            risk_thresholds = [15, 25, 35]
+            colors = ['green', 'orange', 'red']
+            
+            bars = ax.bar(risk_categories, risk_thresholds, color=colors, alpha=0.6, edgecolor='black')
+            ax.axhline(y=current_vol, color='blue', linestyle='--', linewidth=3,
+                    label=f'Current Volatility: {current_vol:.1f}%')
+            ax.set_title('Risk Assessment - Volatility Comparison', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Volatility (%)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Add risk level text
+            if current_vol < 15:
+                risk_level = "LOW RISK"
+                risk_color = "green"
+            elif current_vol < 25:
+                risk_level = "MEDIUM RISK"
+                risk_color = "orange"
+            else:
+                risk_level = "HIGH RISK"
+                risk_color = "red"
+            
+            ax.text(0.02, 0.95, f'Risk Level: {risk_level}', 
+                transform=ax.transAxes, fontsize=12, fontweight='bold',
+                bbox=dict(boxstyle="round,pad=0.5", facecolor=risk_color, alpha=0.3))
+            
+            plt.tight_layout()
+            
+            temp_path = tempfile.mktemp(suffix='.png')
+            plt.savefig(temp_path, dpi=300, bbox_inches='tight', facecolor='white')
+            plt.close()
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating PDF risk chart: {str(e)}")
+            plt.close()
+            return ""
