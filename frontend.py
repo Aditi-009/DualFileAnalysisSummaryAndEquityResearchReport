@@ -940,23 +940,17 @@ def main():
     )
 
     # Main content area
-    if not st.session_state.bot_initialized:
-        st.markdown('''
-        <div class="info-box">
-            <h3>Welcome to Enhanced Financial Analysis Dashboard</h3>
-            <p>Please configure your OpenAI API key in the sidebar to get started.</p>
-            
-            <h4>New Enhanced Features:</h4>
-            <ul>
-                <li><strong>Interactive Charts:</strong> Technical analysis with RSI, MACD, Bollinger Bands</li>
-                <li><strong>Sentiment Gauges:</strong> Real-time sentiment visualization</li>
-                <li><strong>Correlation Analysis:</strong> Market relationship heatmaps</li>
-                <li><strong>News Impact:</strong> Timeline analysis of news vs price movements</li>
-                <li><strong>Advanced PDF Reports:</strong> Professional reports with embedded visualizations</li>
-            </ul>
-        </div>
-        ''', unsafe_allow_html=True)
-        return
+if not st.session_state.bot_initialized:
+        st.info("Welcome to Enhanced Financial Analysis Dashboard")
+        st.write("Please configure your OpenAI API key in the sidebar to get started.")
+        
+        st.subheader("New Enhanced Features:")
+        st.write("- *Interactive Charts:* Technical analysis with RSI, MACD, Bollinger Bands")
+        st.write("- *Sentiment Gauges:* Real-time sentiment visualization")
+        st.write("- *Correlation Analysis:* Market relationship heatmaps")
+        st.write("- *News Impact:* Timeline analysis of news vs price movements")
+        st.write("- *Advanced PDF Reports:* Professional reports with embedded visualizations")
+        return
     
     # File upload section
     st.markdown('<div class="section-header">Data Upload</div>', unsafe_allow_html=True)
@@ -1124,4 +1118,5 @@ if __name__ == "__main__":
                 <pre>{str(e)}</pre>
             </details>
         </div> 
+
         """, unsafe_allow_html=True)
