@@ -316,42 +316,32 @@ class EnhancedDualFileAnalysisBot:
         logger.info(f"Final extracted company info: {company_info}")
         return company_info
     
-    def validate_input_files(self, news_df: pd.DataFrame, reddit_df: pd.DataFrame) -> Tuple[bool, str]:
-        """Validate both input files before analysis"""
+    def validate_input_files(self, news_df: Optional[pd.DataFrame], reddit_df: Optional[pd.DataFrame]) -> Tuple[bool, str]:
         try:
-            # 1. Ensure files are not identical
-            if news_df.equals(reddit_df):
-                return False, "Both input files appear to be identical. Please upload different files."
+            if news_df is None and reddit_df is None:
+                return False, "At least one file (news or reddit) must be provided."
 
-            # 2. Check ticker consistency
+            # If only one file is provided, it's valid
+            if news_df is None or reddit_df is None:
+                return True, "Validation passed: Single file provided."
+
+            # If both are provided, do ticker checks
+            if news_df.equals(reddit_df):
+                return False, "Both input files appear to be identical."
+            
             ticker_cols_news = [col for col in news_df.columns if 'ticker' in col.lower()]
             ticker_cols_reddit = [col for col in reddit_df.columns if 'ticker' in col.lower()]
-            
-            if not ticker_cols_news or not ticker_cols_reddit:
-                return False, "Both files must contain a 'ticker' column."
-            
-            news_tickers = set(news_df[ticker_cols_news[0]].dropna().unique())
-            reddit_tickers = set(reddit_df[ticker_cols_reddit[0]].dropna().unique())
-            
-            if news_tickers != reddit_tickers:
-                return False, "Ticker mismatch: both files must have the same ticker symbols."
+            if ticker_cols_news and ticker_cols_reddit:
+                news_tickers = set(news_df[ticker_cols_news[0]].dropna().unique())
+                reddit_tickers = set(reddit_df[ticker_cols_reddit[0]].dropna().unique())
+                if news_tickers != reddit_tickers:
+                    return False, "Ticker mismatch: both files must have the same ticker symbols."
 
-            # 4. Check required columns
-            # News must have a 'text' column
-            has_text = any('text' in col.lower() for col in news_df.columns)
-            if not has_text:
-                return False, "Validation failed: The news file must contain a 'text' column."
-
-            # Reddit must have a 'body' column
-            has_body = any('body' in col.lower() for col in reddit_df.columns)
-            if not has_body:
-                return False, "Validation failed: The reddit file must contain a 'body' column."
-
-            # All validations passed
-            return True, "Validation passed: Files are valid and ready for analysis."
-
+            return True, "Validation passed: Files are valid."
         except Exception as e:
             return False, f"Validation error: {str(e)}"
+
+
 
     def _extract_company_from_text_enhanced(self, text: str) -> Dict[str, str]:
         """Enhanced AI extraction with better ticker recognition"""

@@ -14,6 +14,7 @@ from pathlib import Path
 import logging
 from PIL import Image
 import matplotlib.pyplot as plt
+import streamlit as st
 
 # Import the backend
 from backend import EnhancedDualFileAnalysisBot
@@ -48,16 +49,17 @@ st.markdown("""
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 1rem;
         border-radius: 10px;
-        color: black;
+        color: white;
         text-align: center;
         margin: 0.5rem 0;
     }
     .success-box {
-        background-color: #d4edda;
+        background-color:#155724;
         border: 1px solid #c3e6cb;
         border-radius: 5px;
         padding: 1rem;
         margin: 1rem 0;
+        color: white;
     }
     .error-box {
         background-color: #f8d7da;
@@ -86,16 +88,16 @@ st.markdown("""
     .stTabs [data-baseweb="tab"] {
         height: 50px;
         white-space: pre-wrap;
-        background-color: #f0f2f6;
+        background-color: #155724;
         border-radius: 4px 4px 0 0;
         gap: 10px;
         padding-left: 20px;
         padding-right: 20px;
-        color: black;
+        color: #white;
     }
     .stTabs [aria-selected="true"] {
         background-color: #2E8B57;
-        color: black;
+        color: Black;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -122,27 +124,43 @@ if st.session_state['email_enabled']:
 else:
     send_email_button = False
 
+from dotenv import load_dotenv
+import os
+
+# Load environment variables once
+load_dotenv()
+
+# Cache API key for 15 minutes
+@st.cache_data(ttl=900)
+def get_api_key():
+    return os.getenv("OPENAI_API_KEY")
+
 
 def initialize_bot():
     """Initialize the analysis bot with API key and email config"""
     try:
-        api_key = st.session_state.get('openai_api_key', '')
+        # ✅ Always fetch from .env
+        api_key = get_api_key()
         email_config = None
-        
+
         if st.session_state.get('email_enabled', False):
             email_config = {
                 'email_address': st.session_state.get('email_address', ''),
                 'app_password': st.session_state.get('email_password', '')
             }
-        
+
         if api_key:
             bot = EnhancedDualFileAnalysisBot(api_key=api_key, email_config=email_config)
             st.session_state.bot = bot
             st.session_state.bot_initialized = True
             return True
+        else:
+            st.error("❌ No API key found in .env file. Please add OPENAI_API_KEY to your .env")
+            return False
     except Exception as e:
         st.error(f"Failed to initialize bot: {str(e)}")
     return False
+
 
 def create_download_link(file_path, filename):
     """Create a download link for a file"""
@@ -387,7 +405,7 @@ def display_enhanced_charts(results):
         st.subheader("Technical Indicators & Price Analysis")
         try:
             tech_chart = create_technical_indicators_chart(stock_data)
-            st.plotly_chart(tech_chart, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(tech_chart, use_container_width=True)
         except Exception as e:
             st.error(f"Error creating technical analysis chart: {str(e)}")
     
@@ -401,7 +419,7 @@ def display_enhanced_charts(results):
         
         try:
             gauge_fig = display_interactive_sentiment_gauge(sentiment_score, sentiment_label)
-            st.plotly_chart(gauge_fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(gauge_fig, use_container_width=True)
         except Exception as e:
             st.error(f"Error creating sentiment gauge: {str(e)}")
         
@@ -419,7 +437,7 @@ def display_enhanced_charts(results):
                     marker_colors=['#2E8B57', '#DC143C', '#FFD700']
                 )])
                 fig.update_layout(title="News Sentiment Distribution", height=400)
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                st.plotly_chart(fig, use_container_width=True)
         
         with col2:
             reddit_sentiment = sentiment_data.get('reddit_sentiment', {})
@@ -432,13 +450,13 @@ def display_enhanced_charts(results):
                     marker_colors=['#2E8B57', '#DC143C', '#FFD700']
                 )])
                 fig.update_layout(title="Social Media Sentiment Distribution", height=400)
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                st.plotly_chart(fig, use_container_width=True)
     
     with tab3:
         st.subheader("Correlation & Market Relationships")
         try:
             corr_fig = create_correlation_heatmap(news_df, reddit_df, stock_data)
-            st.plotly_chart(corr_fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(corr_fig, use_container_width=True)
         except Exception as e:
             st.error(f"Error creating correlation chart: {str(e)}")
         
@@ -459,7 +477,7 @@ def display_enhanced_charts(results):
         st.subheader("News Impact & Timeline Analysis")
         try:
             news_fig = create_news_impact_timeline(news_df, stock_data)
-            st.plotly_chart(news_fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(news_fig, use_container_width=True)
         except Exception as e:
             st.error(f"Error creating news impact chart: {str(e)}")
         
@@ -476,7 +494,7 @@ def display_enhanced_charts(results):
             st.metric("Impact Score", f"{impact_score:.1f}")
 
 def display_chart_images(results):
-    """Display static chart images generated by the backend and allow email distribution"""
+    """Display static chart images generated by the backend"""
     generated_charts = results.get('generated_charts', [])
     
     if generated_charts:
@@ -484,10 +502,9 @@ def display_chart_images(results):
         
         # Display charts in a grid
         cols_per_row = 1
-        chart_titles = [
-            "Market Comparison", "Technical Analysis", 
-            "Risk Assessment","News Impact",
-            "Correlation Analysis"
+        chart_titles = [  # <-- This is your fixed chart (index 0)
+            "Market Comparison", 
+            "Technical Analysis"
         ]
         
         for i in range(0, len(generated_charts), cols_per_row):
@@ -506,8 +523,6 @@ def display_chart_images(results):
                                 
                                 image = Image.open(chart_path)
                                 st.image(image, use_container_width=True)
-                                
-                                # Download link for individual chart
                                 
                             except Exception as e:
                                 st.error(f"Error displaying chart: {str(e)}")
@@ -673,7 +688,7 @@ def display_analysis_results(results):
     
     # Success message
     st.markdown('''
-    <div class="success-box" style="color: black;">
+    <div class="success-box">
         <h3>Analysis Completed Successfully!</h3>
         <p>Your comprehensive financial analysis has been generated with enhanced visualizations.</p>
     </div>
@@ -903,17 +918,10 @@ def main():
     st.markdown('<div class="main-header">Enhanced Financial Analysis Dashboard</div>', unsafe_allow_html=True)
     st.markdown("### AI-Powered Market Intelligence with Advanced Visualizations")
     st.markdown("---")
-    
-    # Sidebar configuration
-    st.sidebar.title("Configuration")
-    
-    # API Key input
-    st.sidebar.subheader("OpenAI API Configuration")
-    api_key = st.sidebar.text_input(
-        "OpenAI API Key",
-        type="password",
-        help="Enter your OpenAI API key for AI-powered analysis"
-    )
+    from dotenv import load_dotenv
+    import os
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
     
     if api_key:
         st.session_state.openai_api_key = api_key
@@ -940,17 +948,17 @@ def main():
     )
 
     # Main content area
-if not st.session_state.bot_initialized:
+    if not st.session_state.bot_initialized:
         st.info("Welcome to Enhanced Financial Analysis Dashboard")
         st.write("Please configure your OpenAI API key in the sidebar to get started.")
         
         st.subheader("New Enhanced Features:")
-        st.write("- *Interactive Charts:* Technical analysis with RSI, MACD, Bollinger Bands")
-        st.write("- *Sentiment Gauges:* Real-time sentiment visualization")
-        st.write("- *Correlation Analysis:* Market relationship heatmaps")
-        st.write("- *News Impact:* Timeline analysis of news vs price movements")
-        st.write("- *Advanced PDF Reports:* Professional reports with embedded visualizations")
-        return
+        st.write("- **Interactive Charts:** Technical analysis with RSI, MACD, Bollinger Bands")
+        st.write("- **Sentiment Gauges:** Real-time sentiment visualization")
+        st.write("- **Correlation Analysis:** Market relationship heatmaps")
+        st.write("- **News Impact:** Timeline analysis of news vs price movements")
+        st.write("- **Advanced PDF Reports:** Professional reports with embedded visualizations")
+        return
     
     # File upload section
     st.markdown('<div class="section-header">Data Upload</div>', unsafe_allow_html=True)
@@ -1046,7 +1054,15 @@ if not st.session_state.bot_initialized:
             st.write(f"{len(email_recipients)} recipients configured")
     
     # Analysis execution
-    st.markdown('<div class="section-header">Enhanced Analysis Execution</div>', unsafe_allow_html=True)
+    st.markdown(
+    """
+    <div class="section-header" style="color:#155724;">
+        Enhanced Analysis Execution
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
     
     # Check if we have data to analyze
     can_analyze = False
@@ -1080,7 +1096,7 @@ if not st.session_state.bot_initialized:
                     st.session_state.analysis_running = False
     else:
         st.markdown('''
-        <div class="info-box">
+        <div class="info-box" style="color:#155724;">
             <p>Please upload at least one data file (news or social media) to run enhanced analysis.</p>
             <p><strong>Tip:</strong> For best results, upload both news and social media data files.</p>
         </div>
@@ -1118,5 +1134,4 @@ if __name__ == "__main__":
                 <pre>{str(e)}</pre>
             </details>
         </div> 
-
         """, unsafe_allow_html=True)
