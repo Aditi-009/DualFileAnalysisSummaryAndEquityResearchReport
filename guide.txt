@@ -1,0 +1,28 @@
+Project Setup Guide
+
+1. Clone the project from GitHub
+Download or clone all project files from your GitHub repository to your local system.
+
+2. Open the project in VS Code
+Launch Visual Studio Code and open the project folder containing 'frontend.py' and 'backend.py'.
+
+3. Set up the environment variables
+Create a new file named '.env' in the root of your project. Copy and paste the .env contents you
+received (e.g., from WhatsApp) into this file. Ensure it includes your 'OPENAI_API_KEY'.
+
+4. Open the integrated terminal in VS Code
+From the top menu bar, select: Terminal.
+
+5. Create and activate a virtual environment
+Run the following commands one by one: 
+a. python -m venv venv (create virtual environment) 
+b. source venv/bin/activate (activate it on macOS/Linux).
+
+6. Install all required dependencies
+Use this command to install all packages listed in 'requirements.txt':   
+pip install -r requirements.txt
+
+7. Run the Streamlit app
+Once installation is complete, start the application with: 
+streamlit run frontend.py
+
