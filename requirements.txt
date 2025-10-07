@@ -1,0 +1,35 @@
+# Core dependencies
+pandas
+numpy
+openai
+python-dotenv
+
+# Web app
+streamlit
+plotly
+matplotlib
+seaborn
+Pillow
+
+# PDF generation
+reportlab
+wordcloud
+
+# Email handling
+smtplib
+imaplib
+email-validator
+
+# Data handling
+yfinance
+openpyxl
+
+# Logging and utilities
+pathlib
+requests
+
+# For zip and compression
+zipfile36
+
+# Optional (if not already installed with standard libs)
+typing-extensions
